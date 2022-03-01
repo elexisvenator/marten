@@ -13,7 +13,7 @@ namespace Marten.Events.Aggregation
             return new(streams.Select(s =>
             {
                 var tenant = tenancy.GetTenant(s.TenantId);
-                return new EventSlice<TDoc, string>(s.Key!, tenant, s.Events);
+                return new EventSlice<TDoc, string>(s.Key!, tenant, s.GetPreparedEvents());
             }).ToList());
         }
 

@@ -39,7 +39,7 @@ namespace Marten.Events.TestSupport
                 step.Description = $"Append({stream}, {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Append(_store.Events, stream, events);
+            return StreamAction.Append(stream, events);
         }
 
         public StreamAction Append(Guid stream, params object[] events)
@@ -54,7 +54,7 @@ namespace Marten.Events.TestSupport
                 step.Description = $"Append({stream}, {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Append(_store.Events, stream, events);
+            return StreamAction.Append(stream, events);
         }
 
         public StreamAction Append(string stream, IEnumerable<object> events)
@@ -69,7 +69,7 @@ namespace Marten.Events.TestSupport
                 step.Description = $"Append('{stream}', {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Append(_store.Events, stream, events);
+            return StreamAction.Append(stream, events);
         }
 
         public StreamAction Append(string stream, params object[] events)
@@ -84,7 +84,7 @@ namespace Marten.Events.TestSupport
                 step.Description = $"Append('{stream}', {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Append(_store.Events, stream, events);
+            return StreamAction.Append(stream, events);
         }
 
         public StreamAction Append(Guid stream, long expectedVersion, params object[] events)
@@ -100,7 +100,7 @@ namespace Marten.Events.TestSupport
                     $"Append({stream}, {expectedVersion}, {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Append(_store.Events, stream, events);
+            return StreamAction.Append(stream, events);
         }
 
         public StreamAction Append(string stream, long expectedVersion, IEnumerable<object> events)
@@ -116,7 +116,7 @@ namespace Marten.Events.TestSupport
                     $"Append(\"{stream}\", {expectedVersion}, {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Append(_store.Events, stream, events);
+            return StreamAction.Append(stream, events);
         }
 
         public StreamAction Append(string stream, long expectedVersion, params object[] events)
@@ -132,7 +132,7 @@ namespace Marten.Events.TestSupport
                     $"Append(\"{stream}\", {expectedVersion}, {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Append(_store.Events, stream, events);
+            return StreamAction.Append(stream, events);
         }
 
         public StreamAction StartStream<TAggregate>(Guid id, params object[] events) where TAggregate : class
@@ -148,7 +148,7 @@ namespace Marten.Events.TestSupport
                     $"StartStream<{typeof(TAggregate).FullNameInCode()}>({id}, {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, id, events);
+            return StreamAction.Start(id, events);
         }
 
         public StreamAction StartStream(Type aggregateType, Guid id, IEnumerable<object> events)
@@ -164,7 +164,7 @@ namespace Marten.Events.TestSupport
                     $"StartStream({aggregateType.FullNameInCode()}, {id}, {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, id, events);
+            return StreamAction.Start(id, events);
         }
 
         public StreamAction StartStream(Type aggregateType, Guid id, params object[] events)
@@ -180,7 +180,7 @@ namespace Marten.Events.TestSupport
                     $"StartStream({aggregateType.FullNameInCode()}, {id}, {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, id, events);
+            return StreamAction.Start(id, events);
         }
 
         public StreamAction StartStream<TAggregate>(string streamKey, IEnumerable<object> events)
@@ -197,7 +197,7 @@ namespace Marten.Events.TestSupport
                     $"StartStream<{typeof(TAggregate).FullNameInCode()}>(\"{streamKey}\", {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, streamKey, events);
+            return StreamAction.Start(streamKey, events);
         }
 
         public StreamAction StartStream<TAggregate>(string streamKey, params object[] events) where TAggregate : class
@@ -213,7 +213,7 @@ namespace Marten.Events.TestSupport
                     $"StartStream<{typeof(TAggregate).FullNameInCode()}>(\"{streamKey}\", {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, streamKey, events);
+            return StreamAction.Start(streamKey, events);
         }
 
         public StreamAction StartStream(Type aggregateType, string streamKey, IEnumerable<object> events)
@@ -229,7 +229,7 @@ namespace Marten.Events.TestSupport
                     $"StartStream({aggregateType.FullNameInCode()}, \"{streamKey}\", {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, streamKey, events);
+            return StreamAction.Start(streamKey, events);
         }
 
         public StreamAction StartStream(Type aggregateType, string streamKey, params object[] events)
@@ -245,7 +245,7 @@ namespace Marten.Events.TestSupport
                     $"StartStream({aggregateType.FullNameInCode()}, \"{streamKey}\", {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, streamKey, events);
+            return StreamAction.Start(streamKey, events);
         }
 
         public StreamAction StartStream(Guid id, IEnumerable<object> events)
@@ -260,7 +260,7 @@ namespace Marten.Events.TestSupport
                 step.Description = $"StartStream({id}, {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, id, events);
+            return StreamAction.Start(id, events);
         }
 
         public StreamAction StartStream(Guid id, params object[] events)
@@ -275,7 +275,7 @@ namespace Marten.Events.TestSupport
                 step.Description = $"StartStream({id}, {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, id, events);
+            return StreamAction.Start(id, events);
         }
 
         public StreamAction StartStream(string streamKey, IEnumerable<object> events)
@@ -290,7 +290,7 @@ namespace Marten.Events.TestSupport
                 step.Description = $"StartStream(\"{streamKey}\", {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, streamKey, events);
+            return StreamAction.Start(streamKey, events);
         }
 
         public StreamAction StartStream(string streamKey, params object[] events)
@@ -305,7 +305,7 @@ namespace Marten.Events.TestSupport
                 step.Description = $"StartStream(\"{streamKey}\", {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, streamKey, events);
+            return StreamAction.Start(streamKey, events);
         }
 
         public StreamAction StartStream<TAggregate>(IEnumerable<object> events) where TAggregate : class
@@ -322,7 +322,7 @@ namespace Marten.Events.TestSupport
                     $"StartStream<{typeof(TAggregate).FullNameInCode()}>({events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, streamId, events);
+            return StreamAction.Start(streamId, events);
         }
 
         public StreamAction StartStream<TAggregate>(params object[] events) where TAggregate : class
@@ -339,7 +339,7 @@ namespace Marten.Events.TestSupport
                     $"StartStream<{typeof(TAggregate).FullNameInCode()}>({events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, streamId, events);
+            return StreamAction.Start(streamId, events);
         }
 
         public StreamAction StartStream(Type aggregateType, IEnumerable<object> events)
@@ -356,7 +356,7 @@ namespace Marten.Events.TestSupport
                     $"StartStream({aggregateType.FullNameInCode()}, {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, streamId, events);
+            return StreamAction.Start(streamId, events);
         }
 
         public StreamAction StartStream(Type aggregateType, params object[] events)
@@ -373,7 +373,7 @@ namespace Marten.Events.TestSupport
                     $"StartStream({aggregateType.FullNameInCode()}, {events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, streamId, events);
+            return StreamAction.Start(streamId, events);
         }
 
         public StreamAction StartStream(IEnumerable<object> events)
@@ -389,7 +389,7 @@ namespace Marten.Events.TestSupport
                 step.Description = $"StartStream({events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, streamId, events);
+            return StreamAction.Start(streamId, events);
         }
 
         public StreamAction StartStream(params object[] events)
@@ -405,7 +405,7 @@ namespace Marten.Events.TestSupport
                 step.Description = $"StartStream({events.Select(x => x.ToString()).Join(", ")})";
             }
 
-            return StreamAction.Start(_store.Events, streamId, events);
+            return StreamAction.Start(streamId, events);
         }
     }
 }

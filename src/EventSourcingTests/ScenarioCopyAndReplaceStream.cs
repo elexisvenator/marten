@@ -1,6 +1,7 @@
-﻿using System.Linq;
+using System.Linq;
 using System.Threading.Tasks;
 using EventSourcingTests.Projections;
+using Marten.Events;
 using Marten.Testing.Harness;
 using Xunit;
 
@@ -48,23 +49,42 @@ namespace EventSourcingTests
 
                 var transformedEvents = events.SelectMany(x =>
                 {
+                    void SetRestreamHeaders(PreEvent @event)
+                    {
+                        @event.SetHeader("copied_from_event", x.Id);
+                        @event.SetHeader("moved_from_stream", started.Name);
+                    }
+
                     switch (x.Data)
                     {
                         case MonsterSlayed monster:
                         {
                             // Trolls we remove from our transformed stream
-                            return monster.Name.Equals("Troll") ? new object[] { } : new[] { monster };
+                            if (monster.Name.Equals("Troll")) return Enumerable.Empty<PreEvent>();
+
+                            var newEvent = PreEvent.FromExisting(x);
+                            SetRestreamHeaders(newEvent);
+                            return new[] { newEvent };
                         }
                         case MembersJoined members:
                         {
                             // MembersJoined events we transform into a series of events
-                            return MemberJoined.From(members);
+                            return MemberJoined.From(members).Select(member =>
+                            {
+                                var newEvent = new PreEvent(member).WithMetadata(x);
+                                SetRestreamHeaders(newEvent);
+                                return newEvent;
+                            });
+                        }
+                        default:
+                        {
+                            var newEvent = PreEvent.FromExisting(x);
+                            SetRestreamHeaders(newEvent);
+                            return new[] { newEvent };
                         }
                     }
-
-                    return new[] { x.Data };
-                }).Where(x => x != null).ToArray();
-
+                }).Where(x => x != null).Cast<object>().ToArray();
+                
                 var moveTo = $"{started.Name} without Trolls";
                 // We copy the transformed events to a new stream
                 session.Events.StartStream<Quest>(moveTo, transformedEvents);

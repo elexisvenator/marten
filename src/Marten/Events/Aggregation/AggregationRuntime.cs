@@ -124,7 +124,7 @@ namespace Marten.Events.Aggregation
             // Doing the filtering here to prevent unnecessary network round trips by allowing
             // an aggregate projection to "work" on a stream with no matching events
             var filteredStreams = streams
-                .Where(x => Projection.AppliesTo(x.Events.Select(x => x.EventType)))
+                .Where(x => Projection.AppliesTo(x.GetPreparedEvents().Select(x => x.EventType)))
                 .ToArray();
 
             var slices = await Slicer.SliceInlineActions(operations, filteredStreams, Tenancy).ConfigureAwait(false);

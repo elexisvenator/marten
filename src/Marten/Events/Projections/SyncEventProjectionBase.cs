@@ -14,7 +14,7 @@ namespace Marten.Events.Projections
         {
             foreach (var stream in streams)
             {
-                foreach (var @event in stream.Events)
+                foreach (var @event in stream.GetPreparedEvents())
                 {
                     try
                     {

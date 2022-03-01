@@ -186,7 +186,7 @@ namespace Marten.Internal
 
         IEnumerable<IEvent> IChangeSet.GetEvents()
         {
-            return Streams.SelectMany(x => x.Events);
+            return Streams.SelectMany(x => x.GetPreparedEvents());
         }
 
         IEnumerable<StreamAction> IChangeSet.GetStreams()

@@ -103,7 +103,7 @@ namespace Marten.Events.Aggregation
 
         public bool MatchesAnyDeleteType(StreamAction action)
         {
-            return action.Events.Select(x => x.EventType).Intersect(DeleteEvents).Any();
+            return action.GetPreparedEvents().Select(x => x.EventType).Intersect(DeleteEvents).Any();
         }
 
         protected override IEnumerable<Type> publishedTypes()

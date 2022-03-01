@@ -36,7 +36,7 @@ namespace Marten.Events.Projections
             IQuerySession querySession,
             IEnumerable<StreamAction> streams, ITenancy tenancy)
         {
-            var events = streams.SelectMany(x => x.Events).ToList();
+            var events = streams.SelectMany(x => x.GetPreparedEvents()).ToList();
 
 
             var groups = await this.As<IEventSlicer<TDoc, TId>>().SliceAsyncEvents(querySession, events, tenancy).ConfigureAwait(false);

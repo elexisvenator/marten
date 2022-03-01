@@ -202,16 +202,27 @@ namespace Marten.Internal.Sessions
             ChangeTrackers.RemoveAll(x => x.Document.GetType().CanBeCastTo(type));
         }
 
-        public void SetHeader(string key, object value)
+        public void SetHeader(string key, object? value)
         {
+            if (value is null && Headers is null)
+            {
+                return;
+            }
+
             Headers ??= new Dictionary<string, object>();
+
+            if (value is null)
+            {
+                Headers.Remove(key);
+                return;
+            }
 
             Headers[key] = value;
         }
 
         public object? GetHeader(string key)
         {
-            return Headers?[key];
+            return Headers?.TryGetValue(key, out var value) ?? false ? value : null;
         }
 
         /// <summary>
