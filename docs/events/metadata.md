@@ -29,7 +29,7 @@ The actual metadata is accessible from the `IEvent` interface or `Event<T>` even
 <!-- snippet: sample_IEvent -->
 <a id='snippet-sample_ievent'></a>
 ```cs
-public interface IEvent
+public interface IEvent : IEventMetadata
 {
     /// <summary>
     /// Unique identifier for the event. Uses a sequential Guid
@@ -90,6 +90,15 @@ public interface IEvent
     string DotNetTypeName { get; set; }
 
     /// <summary>
+    /// Has this event been archived and no longer applicable
+    /// to projected views
+    /// </summary>
+    bool IsArchived { get; set; }
+}
+
+public interface IEventMetadata
+{
+    /// <summary>
     /// Optional metadata describing the causation id
     /// </summary>
     string? CausationId { get; set; }
@@ -109,7 +118,7 @@ public interface IEvent
     /// </summary>
     /// <param name="key"></param>
     /// <param name="value"></param>
-    void SetHeader(string key, object value);
+    void SetHeader(string key, object? value);
 
     /// <summary>
     /// Get an optional user defined metadata value by key
@@ -117,13 +126,7 @@ public interface IEvent
     /// <param name="key"></param>
     /// <returns></returns>
     object? GetHeader(string key);
-
-    /// <summary>
-    /// Has this event been archived and no longer applicable
-    /// to projected views
-    /// </summary>
-    bool IsArchived { get; set; }
 }
 ```
-<sup><a href='https://github.com/JasperFx/marten/blob/master/src/Marten/Events/Event.cs#L8-L105' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_ievent' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/marten/blob/master/src/Marten/Events/Event.cs#L8-L108' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_ievent' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
