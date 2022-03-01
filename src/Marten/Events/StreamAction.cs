@@ -5,7 +5,7 @@ using Marten.Events.Operations;
 using Marten.Exceptions;
 using Marten.Internal;
 using Marten.Schema.Identity;
-using Marten.Storage;
+
 #nullable enable
 namespace Marten.Events
 {
@@ -24,11 +24,80 @@ namespace Marten.Events
         Append
     }
 
+
+    public class PreEvent: IEventMetadata
+    {
+        public static PreEvent FromExisting(IEvent existing)
+        {
+            return new PreEvent(existing.Data).WithMetadata(existing);
+        }
+
+        public PreEvent(object data)
+        {
+            Data = data;
+        }
+
+        public PreEvent WithMetadata(IEventMetadata metadata)
+        {
+            CausationId = metadata.CausationId ?? CausationId;
+            CorrelationId = metadata.CorrelationId ?? CorrelationId;
+
+            if (!(metadata.Headers?.Count > 0))
+            {
+                return this;
+            }
+
+            if (!(Headers?.Count > 0))
+            {
+                Headers = new Dictionary<string, object>(metadata.Headers);
+                return this;
+            }
+
+            foreach (var metadataHeader in metadata.Headers)
+            {
+                Headers.Add(metadataHeader.Key, metadataHeader.Value);
+            }
+
+            return this;
+        }
+
+        public object Data { get; }
+        
+        public string? CausationId { get; set; }
+
+        public string? CorrelationId { get; set; }
+
+        public Dictionary<string, object>? Headers { get; set; }
+
+        public void SetHeader(string key, object? value)
+        {
+            if (value is null && Headers is null)
+            {
+                return;
+            }
+
+            Headers ??= new Dictionary<string, object>();
+
+            if (value is null)
+            {
+                Headers.Remove(key);
+                return;
+            }
+
+            Headers[key] = value;
+        }
+
+        public object? GetHeader(string key)
+        {
+            return Headers?.TryGetValue(key, out var value) ?? false ? value : null;
+        }
+    }
+
     /// <summary>
     /// Models a series of events to be appended to either a new or
     /// existing stream
     /// </summary>
-    public class StreamAction
+    public class StreamAction : IEventMetadata
     {
         /// <summary>
         /// Identity of the stream if using Guid's as the identity
@@ -63,10 +132,53 @@ namespace Marten.Events
         /// The Id of the current tenant
         /// </summary>
         public string? TenantId { get; internal set; }
+        
+        private readonly List<PreEvent> _events = new();
 
+        private IReadOnlyList<IEvent>? _preparedEvents = null;
 
+        public bool EventsPrepared => _preparedEvents is not null;
 
-        private readonly List<IEvent> _events = new();
+        public string? CausationId { get; set; }
+
+        public string? CorrelationId { get; set; }
+
+        public Dictionary<string, object>? Headers { get; set; }
+
+        public void SetHeader(string key, object? value)
+        {
+            if (value is null && Headers is null)
+            {
+                return;
+            }
+
+            Headers ??= new Dictionary<string, object>();
+
+            if (value is null)
+            {
+                Headers.Remove(key);
+                return;
+            }
+
+            Headers[key] = value;
+        }
+
+        public object? GetHeader(string key)
+        {
+            return Headers?.TryGetValue(key, out var value) ?? false ? value : null;
+        }
+
+        internal IReadOnlyList<IEvent> GetPreparedEvents()
+        {
+            if (!EventsPrepared)
+            {
+                // TODO: Custom error
+                throw new InvalidOperationException(
+                    $"Events have not been prepared, '{nameof(PrepareEvents)}' should be called first.");
+            }
+
+            return _preparedEvents!;
+        }
 
         private StreamAction(Guid stream, StreamActionType actionType)
         {
@@ -87,20 +199,20 @@ namespace Marten.Events
             ActionType = actionType;
         }
 
-        internal StreamAction AddEvents(IReadOnlyList<IEvent> events)
+        public StreamAction AddEvents(params object[] events)
         {
-            _events.AddRange(events);
-
-            foreach (var @event in events)
+            if (EventsPrepared)
             {
-                if (@event.Id == Guid.Empty) @event.Id = CombGuidIdGeneration.NewGuid();
-                @event.StreamId = Id;
-                @event.StreamKey = Key;
+                // TODO: Custom error
+                throw new InvalidOperationException(
+                    $"Events have already been prepared, no further events can be added.");
+            }
 
-                if (ExpectedVersionOnServer.HasValue)
-                {
-                    ExpectedVersionOnServer++;
-                }
+            _events.AddRange(events.Select(e => e is PreEvent p ? p : new PreEvent(e)));
+
+            if (ExpectedVersionOnServer.HasValue)
+            {
+                ExpectedVersionOnServer += events.Length;
             }
 
             return this;
@@ -109,7 +221,7 @@ namespace Marten.Events
         /// <summary>
         /// The events involved in this action
         /// </summary>
-        public IReadOnlyList<IEvent> Events => _events;
+        public IReadOnlyList<PreEvent> Events => _events;
 
         /// <summary>
         /// The expected starting version of the stream in the server. This is used
@@ -132,7 +244,6 @@ namespace Marten.Events
         /// </summary>
         public DateTimeOffset? Created { get; internal set; }
 
-
         /// <summary>
         /// Create a new StreamAction for starting a new stream
         /// </summary>
@@ -140,24 +251,8 @@ namespace Marten.Events
         /// <param name="events"></param>
         /// <returns></returns>
         /// <exception cref="EmptyEventStreamException"></exception>
-        public static StreamAction Start(EventGraph graph, Guid streamId, params object[] events)
+        internal static StreamAction Start(Guid streamId, params object[] events)
         {
-            if (!events.Any()) throw new EmptyEventStreamException(streamId);
-
-            return new StreamAction(streamId, StreamActionType.Start).AddEvents(events.Select(graph.BuildEvent).ToArray());
-        }
-
-        /// <summary>
-        /// Create a new StreamAction for starting a new stream
-        /// </summary>
-        /// <param name="streamId"></param>
-        /// <param name="events"></param>
-        /// <returns></returns>
-        /// <exception cref="EmptyEventStreamException"></exception>
-        public static StreamAction Start(Guid streamId, params IEvent[] events)
-        {
-            if (!events.Any()) throw new EmptyEventStreamException(streamId);
-
             return new StreamAction(streamId, StreamActionType.Start).AddEvents(events);
         }
 
@@ -168,22 +263,8 @@ namespace Marten.Events
         /// <param name="events"></param>
         /// <returns></returns>
         /// <exception cref="EmptyEventStreamException"></exception>
-        public static StreamAction Start(EventGraph graph, string streamKey, params object[] events)
+        internal static StreamAction Start(string streamKey, params object[] events)
         {
-            if (!events.Any()) throw new EmptyEventStreamException(streamKey);
-            return new StreamAction(streamKey, StreamActionType.Start).AddEvents(events.Select(graph.BuildEvent).ToArray());
-        }
-
-        /// <summary>
-        /// Create a new StreamAction for starting a new stream
-        /// </summary>
-        /// <param name="streamKey"></param>
-        /// <param name="events"></param>
-        /// <returns></returns>
-        /// <exception cref="EmptyEventStreamException"></exception>
-        public static StreamAction Start(string streamKey, params IEvent[] events)
-        {
-            if (!events.Any()) throw new EmptyEventStreamException(streamKey);
             return new StreamAction(streamKey, StreamActionType.Start).AddEvents(events);
         }
 
@@ -193,24 +274,9 @@ namespace Marten.Events
         /// <param name="streamId"></param>
         /// <param name="events"></param>
         /// <returns></returns>
-        public static StreamAction Append(EventGraph graph, Guid streamId, params object[] events)
+        internal static StreamAction Append(Guid streamId, params object[] events)
         {
-            var stream = new StreamAction(streamId, StreamActionType.Append);
-            stream.AddEvents(events.Select(graph.BuildEvent).ToArray());
-            return stream;
-        }
-
-        /// <summary>
-        /// Create a new StreamAction for appending to an existing stream
-        /// </summary>
-        /// <param name="streamId"></param>
-        /// <param name="events"></param>
-        /// <returns></returns>
-        public static StreamAction Append(Guid streamId, IEvent[] events)
-        {
-            var stream = new StreamAction(streamId, StreamActionType.Append);
-            stream.AddEvents(events);
-            return stream;
+            return new StreamAction(streamId, StreamActionType.Append).AddEvents(events);
         }
 
         /// <summary>
@@ -219,24 +285,9 @@ namespace Marten.Events
         /// <param name="streamKey"></param>
         /// <param name="events"></param>
         /// <returns></returns>
-        public static StreamAction Append(EventGraph graph, string streamKey, params object[] events)
+        internal static StreamAction Append(string streamKey, params object[] events)
         {
-            var stream = new StreamAction(streamKey, StreamActionType.Append);
-            stream._events.AddRange(events.Select(graph.BuildEvent));
-            return stream;
-        }
-
-        /// <summary>
-        /// Create a new StreamAction for appending to an existing stream
-        /// </summary>
-        /// <param name="streamKey"></param>
-        /// <param name="events"></param>
-        /// <returns></returns>
-        public static StreamAction Append(string streamKey, IEvent[] events)
-        {
-            var stream = new StreamAction(streamKey, StreamActionType.Append);
-            stream._events.AddRange(events.OrderBy(x => x.Version));
-            return stream;
+            return new StreamAction(streamKey, StreamActionType.Append).AddEvents(events);
         }
 
         /// <summary>
@@ -250,6 +301,7 @@ namespace Marten.Events
         /// <exception cref="EventStreamUnexpectedMaxEventIdException"></exception>
         internal void PrepareEvents(long currentVersion, EventGraph graph, Queue<long> sequences, IMartenSession session)
         {
+            ThrowIfStartWithNoEvents();
             var timestamp = DateTimeOffset.UtcNow;
 
             if (AggregateType != null)
@@ -273,21 +325,27 @@ namespace Marten.Events
                 ExpectedVersionOnServer = currentVersion;
             }
 
-            foreach (var @event in _events)
+            var preparedEvents = new List<IEvent>();
+            
+            foreach (var preEvent in _events)
             {
+                var @event = graph.BuildEvent(preEvent.Data);
                 @event.Version = ++i;
-                if (@event.Id == Guid.Empty)
-                {
-                    @event.Id = CombGuidIdGeneration.NewGuid();
-                }
+                @event.Id = CombGuidIdGeneration.NewGuid();
+
+                @event.StreamId = Id;
+                @event.StreamKey = Key;
+
                 @event.Sequence = sequences.Dequeue();
                 @event.TenantId = session.TenantId;
                 @event.Timestamp = timestamp;
 
-                ProcessMetadata(@event, graph, session);
+                ProcessMetadata(preEvent, @event, graph, session);
+                preparedEvents.Add(@event);
             }
 
-            Version = Events.Last().Version;
+            _preparedEvents = preparedEvents;
+            Version = i;
         }
 
         internal static StreamAction ForReference(Guid streamId, string tenantId)
@@ -314,24 +372,57 @@ namespace Marten.Events
             };
         }
 
-        private static void ProcessMetadata(IEvent @event, EventGraph graph, IMartenSession session)
+        private void ProcessMetadata(PreEvent preEvent, IEvent @event, EventGraph graph, IMartenSession session)
         {
+            // Order of precedence for metadata is always (pre)event, then stream, then session
             if (graph.Metadata.CausationId.Enabled)
             {
-                @event.CausationId ??= session.CausationId;
+                @event.CausationId = preEvent.CausationId ?? CausationId ?? session.CausationId ;
             }
 
             if (graph.Metadata.CorrelationId.Enabled)
             {
-                @event.CorrelationId = session.CorrelationId;
+                @event.CorrelationId = preEvent.CorrelationId ?? CorrelationId ?? session.CorrelationId;
             }
 
             if (!graph.Metadata.Headers.Enabled) return;
-            if (!(session.Headers?.Count > 0)) return;
-            foreach (var header in session.Headers)
+
+            if (session.Headers?.Count > 0)
+            {
+                foreach (var header in session.Headers)
+                {
+                    @event.SetHeader(header.Key, header.Value);
+                }
+            }
+
+            if (Headers?.Count > 0)
+            {
+                foreach (var header in Headers)
+                {
+                    @event.SetHeader(header.Key, header.Value);
+                }
+            }
+
+            if (!(preEvent.Headers?.Count > 0)) return;
+            foreach (var header in preEvent.Headers)
             {
                 @event.SetHeader(header.Key, header.Value);
             }
+        }
+
+        private void ThrowIfStartWithNoEvents()
+        {
+            if (ActionType != StreamActionType.Start || _events.Any())
+            {
+                return;
+            }
+
+            if (Key is not null)
+            {
+                throw new EmptyEventStreamException(Key);
+            }
+
+            throw new EmptyEventStreamException(Id);
         }
 
         internal static StreamAction For(Guid streamId, IReadOnlyList<IEvent> events)
@@ -347,5 +438,7 @@ namespace Marten.Events
             return new StreamAction(streamKey, action)
                 .AddEvents(events);
         }
+
+
     }
 }

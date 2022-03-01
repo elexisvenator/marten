@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -57,7 +57,7 @@ namespace Marten.Events
                     }
                 }
 
-                foreach (var @event in stream.Events)
+                foreach (var @event in stream.GetPreparedEvents())
                 {
                     session.QueueOperation(storage.AppendEvent(this, session, stream, @event));
                 }
@@ -113,7 +113,7 @@ namespace Marten.Events
                     }
                 }
 
-                foreach (var @event in stream.Events)
+                foreach (var @event in stream.GetPreparedEvents())
                 {
                     session.QueueOperation(storage.AppendEvent(this, session, stream, @event));
                 }
@@ -139,7 +139,7 @@ namespace Marten.Events
 
                 operations.Add(_establishTombstone.Value);
                 var tombstones = session.WorkTracker.Streams
-                    .SelectMany(x => x.Events)
+                    .SelectMany(x => x.GetPreparedEvents())
                     .Select(x => new Event<Tombstone>(tombstone)
                     {
                         Sequence = x.Sequence,

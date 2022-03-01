@@ -6,7 +6,7 @@ using Marten.Storage;
 namespace Marten.Events
 {
     #region sample_IEvent
-    public interface IEvent
+    public interface IEvent : IEventMetadata
     {
         /// <summary>
         /// Unique identifier for the event. Uses a sequential Guid
@@ -67,6 +67,15 @@ namespace Marten.Events
         string DotNetTypeName { get; set; }
 
         /// <summary>
+        /// Has this event been archived and no longer applicable
+        /// to projected views
+        /// </summary>
+        bool IsArchived { get; set; }
+    }
+
+    public interface IEventMetadata
+    {
+        /// <summary>
         /// Optional metadata describing the causation id
         /// </summary>
         string? CausationId { get; set; }
@@ -86,7 +95,7 @@ namespace Marten.Events
         /// </summary>
         /// <param name="key"></param>
         /// <param name="value"></param>
-        void SetHeader(string key, object value);
+        void SetHeader(string key, object? value);
 
         /// <summary>
         /// Get an optional user defined metadata value by key
@@ -94,12 +103,6 @@ namespace Marten.Events
         /// <param name="key"></param>
         /// <returns></returns>
         object? GetHeader(string key);
-
-        /// <summary>
-        /// Has this event been archived and no longer applicable
-        /// to projected views
-        /// </summary>
-        bool IsArchived { get; set; }
     }
 
     #endregion
@@ -179,9 +182,21 @@ namespace Marten.Events
         public string EventTypeName { get; set; } = null!;
         public string DotNetTypeName { get; set; } = null!;
 
-        public void SetHeader(string key, object value)
+        public void SetHeader(string key, object? value)
         {
+            if (value is null && Headers is null)
+            {
+                return;
+            }
+
             Headers ??= new Dictionary<string, object>();
+
+            if (value is null)
+            {
+                Headers.Remove(key);
+                return;
+            }
+
             Headers[key] = value;
         }
 

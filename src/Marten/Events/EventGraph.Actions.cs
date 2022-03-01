@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Linq;
 using Marten.Internal.Sessions;
 
@@ -68,7 +68,7 @@ namespace Marten.Events
                 throw new ArgumentOutOfRangeException(nameof(id), "Cannot use an empty Guid as the stream id");
 
 
-            var stream = StreamAction.Start(this, id, events);
+            var stream = StreamAction.Start(id, events);
             session.WorkTracker.Streams.Add(stream);
 
             return stream;
@@ -82,7 +82,7 @@ namespace Marten.Events
                 throw new ArgumentOutOfRangeException(nameof(streamKey), "The stream key cannot be null or empty");
 
 
-            var stream = StreamAction.Start(this, streamKey, events);
+            var stream = StreamAction.Start(streamKey, events);
 
             session.WorkTracker.Streams.Add(stream);
 
