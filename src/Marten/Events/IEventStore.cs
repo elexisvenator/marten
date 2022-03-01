@@ -248,7 +248,7 @@ namespace Marten.Events
         /// <param name="events"></param>
         /// <exception cref="NonExistentStreamException"></exception>
         /// <returns></returns>
-        Task AppendOptimistic(string streamKey, CancellationToken token, params object[] events);
+        Task<StreamAction> AppendOptimistic(string streamKey, CancellationToken token, params object[] events);
 
         /// <summary>
         /// Append events to an existing stream with optimistic concurrency checks against the
@@ -258,7 +258,7 @@ namespace Marten.Events
         /// <param name="events"></param>
         /// <exception cref="NonExistentStreamException"></exception>
         /// <returns></returns>
-        Task AppendOptimistic(string streamKey, params object[] events);
+        Task<StreamAction> AppendOptimistic(string streamKey, params object[] events);
 
         /// <summary>
         /// Append events to an existing stream with optimistic concurrency checks against the
@@ -269,7 +269,7 @@ namespace Marten.Events
         /// <param name="events"></param>
         /// <exception cref="NonExistentStreamException"></exception>
         /// <returns></returns>
-        Task AppendOptimistic(Guid streamId, CancellationToken token, params object[] events);
+        Task<StreamAction> AppendOptimistic(Guid streamId, CancellationToken token, params object[] events);
 
         /// <summary>
         /// Append events to an existing stream with optimistic concurrency checks against the
@@ -279,7 +279,7 @@ namespace Marten.Events
         /// <param name="events"></param>
         /// <exception cref="NonExistentStreamException"></exception>
         /// <returns></returns>
-        Task AppendOptimistic(Guid streamId, params object[] events);
+        Task<StreamAction> AppendOptimistic(Guid streamId, params object[] events);
 
         /// <summary>
         /// Append events to an existing stream with an exclusive lock against the
@@ -290,7 +290,7 @@ namespace Marten.Events
         /// <param name="events"></param>
         /// <exception cref="NonExistentStreamException"></exception>
         /// <returns></returns>
-        Task AppendExclusive(string streamKey, CancellationToken token, params object[] events);
+        Task<StreamAction> AppendExclusive(string streamKey, CancellationToken token, params object[] events);
 
         /// <summary>
         /// Append events to an existing stream with an exclusive lock against the
@@ -300,7 +300,7 @@ namespace Marten.Events
         /// <param name="events"></param>
         /// <exception cref="NonExistentStreamException"></exception>
         /// <returns></returns>
-        Task AppendExclusive(string streamKey, params object[] events);
+        Task<StreamAction> AppendExclusive(string streamKey, params object[] events);
 
         /// <summary>
         /// Append events to an existing stream with an exclusive lock against the
@@ -310,7 +310,7 @@ namespace Marten.Events
         /// <param name="events"></param>
         /// <exception cref="NonExistentStreamException"></exception>
         /// <returns></returns>
-        Task AppendExclusive(Guid streamId, CancellationToken token, params object[] events);
+        Task<StreamAction> AppendExclusive(Guid streamId, CancellationToken token, params object[] events);
 
         /// <summary>
         /// Append events to an existing stream with an exclusive lock against the
@@ -320,7 +320,7 @@ namespace Marten.Events
         /// <param name="events"></param>
         /// <exception cref="NonExistentStreamException"></exception>
         /// <returns></returns>
-        Task AppendExclusive(Guid streamId, params object[] events);
+        Task<StreamAction> AppendExclusive(Guid streamId, params object[] events);
 
         /// <summary>
         /// Mark a stream and all its events as archived

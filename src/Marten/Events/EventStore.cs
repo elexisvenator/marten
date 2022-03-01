@@ -173,7 +173,7 @@ namespace Marten.Events
             return StartStream(CombGuidIdGeneration.NewGuid(), events);
         }
 
-        public async Task AppendOptimistic(string streamKey, CancellationToken token, params object[] events)
+        public async Task<StreamAction> AppendOptimistic(string streamKey, CancellationToken token, params object[] events)
         {
             _store.Events.EnsureAsStringStorage(_session);
             await _session.Database.EnsureStorageExistsAsync(typeof(IEvent), token).ConfigureAwait(false);
@@ -185,6 +185,7 @@ namespace Marten.Events
 
             var action = Append(streamKey, events);
             action.ExpectedVersionOnServer = version;
+            return action;
         }
 
         private async Task<long> readVersionFromExistingStream(object streamId, CancellationToken token, NpgsqlCommand cmd)
@@ -216,12 +217,12 @@ namespace Marten.Events
             return version;
         }
 
-        public Task AppendOptimistic(string streamKey, params object[] events)
+        public Task<StreamAction> AppendOptimistic(string streamKey, params object[] events)
         {
             return AppendOptimistic(streamKey, CancellationToken.None, events);
         }
 
-        public async Task AppendOptimistic(Guid streamId, CancellationToken token, params object[] events)
+        public async Task<StreamAction> AppendOptimistic(Guid streamId, CancellationToken token, params object[] events)
         {
             _store.Events.EnsureAsGuidStorage(_session);
             await _session.Database.EnsureStorageExistsAsync(typeof(IEvent), token).ConfigureAwait(false);
@@ -233,14 +234,15 @@ namespace Marten.Events
 
             var action = Append(streamId, events);
             action.ExpectedVersionOnServer = version;
+            return action;
         }
 
-        public Task AppendOptimistic(Guid streamId, params object[] events)
+        public Task<StreamAction> AppendOptimistic(Guid streamId, params object[] events)
         {
             return AppendOptimistic(streamId, CancellationToken.None, events);
         }
 
-        public async Task AppendExclusive(string streamKey, CancellationToken token, params object[] events)
+        public async Task<StreamAction> AppendExclusive(string streamKey, CancellationToken token, params object[] events)
         {
             _store.Events.EnsureAsStringStorage(_session);
             await _session.Database.EnsureStorageExistsAsync(typeof(IEvent), token).ConfigureAwait(false);
@@ -254,14 +256,15 @@ namespace Marten.Events
 
             var action = Append(streamKey, events);
             action.ExpectedVersionOnServer = version;
+            return action;
         }
 
-        public Task AppendExclusive(string streamKey, params object[] events)
+        public Task<StreamAction> AppendExclusive(string streamKey, params object[] events)
         {
             return AppendExclusive(streamKey, CancellationToken.None, events);
         }
 
-        public async Task AppendExclusive(Guid streamId, CancellationToken token, params object[] events)
+        public async Task<StreamAction> AppendExclusive(Guid streamId, CancellationToken token, params object[] events)
         {
             _store.Events.EnsureAsGuidStorage(_session);
             await _session.Database.EnsureStorageExistsAsync(typeof(IEvent), token).ConfigureAwait(false);
@@ -275,9 +278,10 @@ namespace Marten.Events
 
             var action = Append(streamId, events);
             action.ExpectedVersionOnServer = version;
+            return action;
         }
 
-        public Task AppendExclusive(Guid streamId, params object[] events)
+        public Task<StreamAction> AppendExclusive(Guid streamId, params object[] events)
         {
             return AppendExclusive(streamId, CancellationToken.None, events);
         }
