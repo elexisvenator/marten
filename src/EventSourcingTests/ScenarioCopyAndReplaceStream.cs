@@ -49,7 +49,7 @@ namespace EventSourcingTests
 
                 var transformedEvents = events.SelectMany(x =>
                 {
-                    void SetRestreamHeaders(PreEvent @event)
+                    void SetRestreamHeaders(UncommittedEvent @event)
                     {
                         @event.SetHeader("copied_from_event", x.Id);
                         @event.SetHeader("moved_from_stream", started.Name);
@@ -60,9 +60,9 @@ namespace EventSourcingTests
                         case MonsterSlayed monster:
                         {
                             // Trolls we remove from our transformed stream
-                            if (monster.Name.Equals("Troll")) return Enumerable.Empty<PreEvent>();
+                            if (monster.Name.Equals("Troll")) return Enumerable.Empty<UncommittedEvent>();
 
-                            var newEvent = PreEvent.FromExisting(x);
+                            var newEvent = UncommittedEvent.FromExisting(x);
                             SetRestreamHeaders(newEvent);
                             return new[] { newEvent };
                         }
@@ -71,14 +71,14 @@ namespace EventSourcingTests
                             // MembersJoined events we transform into a series of events
                             return MemberJoined.From(members).Select(member =>
                             {
-                                var newEvent = new PreEvent(member).WithMetadata(x);
+                                var newEvent = new UncommittedEvent(member).WithMetadata(x);
                                 SetRestreamHeaders(newEvent);
                                 return newEvent;
                             });
                         }
                         default:
                         {
-                            var newEvent = PreEvent.FromExisting(x);
+                            var newEvent = UncommittedEvent.FromExisting(x);
                             SetRestreamHeaders(newEvent);
                             return new[] { newEvent };
                         }

@@ -1,5 +1,4 @@
 using System;
-using System.Linq;
 using Marten.Internal.Sessions;
 
 namespace Marten.Events
@@ -13,20 +12,13 @@ namespace Marten.Events
             if (stream == Guid.Empty)
                 throw new ArgumentOutOfRangeException(nameof(stream), "Cannot use an empty Guid as the stream id");
 
-            var wrapped = events.Select(o =>
-            {
-                var e = BuildEvent(o);
-                e.StreamId = stream;
-                return e;
-            }).ToArray();
-
             if (session.WorkTracker.TryFindStream(stream, out var eventStream))
             {
-                eventStream.AddEvents(wrapped);
+                eventStream.AddEvents(events);
             }
             else
             {
-                eventStream = StreamAction.Append(stream, wrapped);
+                eventStream = StreamAction.Append(stream, events);
                 session.WorkTracker.Streams.Add(eventStream);
             }
 
@@ -40,20 +32,13 @@ namespace Marten.Events
             if (stream.IsEmpty())
                 throw new ArgumentOutOfRangeException(nameof(stream), "The stream key cannot be null or empty");
 
-            var wrapped = events.Select(o =>
-            {
-                var e = BuildEvent(o);
-                e.StreamKey = stream;
-                return e;
-            }).ToArray();
-
             if (session.WorkTracker.TryFindStream(stream, out var eventStream))
             {
-                eventStream.AddEvents(wrapped);
+                eventStream.AddEvents(events);
             }
             else
             {
-                eventStream = StreamAction.Append(stream, wrapped);
+                eventStream = StreamAction.Append(stream, events);
                 session.WorkTracker.Streams.Add(eventStream);
             }
 

@@ -259,7 +259,6 @@ namespace Marten.Events
             return session.EventStorage();
         }
 
-
         internal IEvent BuildEvent(object eventData)
         {
             if (eventData == null)
