@@ -67,7 +67,7 @@ public abstract class AggregationRuntime<TDoc, TId>: IAggregationRuntime<TDoc, T
         }
 
         var aggregate = slice.Aggregate;
-        if (slice.Aggregate == null && lifecycle == ProjectionLifecycle.Inline)
+        if (slice.Aggregate == null && lifecycle == ProjectionLifecycle.Inline && (Slicer is not ISingleStreamSlicer || slice.ActionType != StreamActionType.Start))
         {
             aggregate = await Storage.LoadAsync(slice.Id, session, cancellation).ConfigureAwait(false);
         }
@@ -119,8 +119,25 @@ public abstract class AggregationRuntime<TDoc, TId>: IAggregationRuntime<TDoc, T
         var storageOperation = Storage.Upsert(aggregate, session, slice.Tenant.TenantId);
         if (Slicer is ISingleStreamSlicer && lastEvent != null && storageOperation is IRevisionedOperation op)
         {
-            op.Revision = (int)lastEvent.Version;
             op.IgnoreConcurrencyViolation = true;
+
+            if (slice.ActionType == StreamActionType.Append && slice.Events()[0].Version <= 1)
+            {
+                // With QuickAppend, version number is not set (except when using expectedVersion)
+                // This is broken! If we try to upsert the aggregate then either a) it will be inserted with the incorrect version or b) it will not be inserted!
+                // Workaround: apply expectedVersion on append, or appendOptimistic.
+                // Possible Fix: infer the actual version from the inline projection's current version
+                // this works as long as the inline projection version is consistent
+                // in order for this to properly work, we need to have a way of getting the revision of any aggregate
+                // which there is currently no implemented way to do (needs some codegen)
+                // AND the inline projection needs a revision column (which is already the recommendation for QuickAppend)
+
+                throw new NotSupportedException($"Unable to apply events to an existing inline projection document in quick append mode without version information. As a workaround, use session.Events.ApplyOptimistic() or pass in the expectedVersion to session.Events.Apply().  The projection should also implement IRevisioned or have a [Version] column if it does not already. Affected projection: {aggregate.GetType().Name}. Sample affected event: {lastEvent.EventTypeName}");
+            }
+            else
+            {
+                op.Revision = (int)lastEvent.Version;
+            }
         }
 
         session.QueueOperation(storageOperation);

@@ -1,9 +1,7 @@
 using System;
 using System.Collections.Generic;
-using System.ComponentModel;
 using System.Threading;
 using System.Threading.Tasks;
-using JasperFx.CodeGeneration;
 using JasperFx.Core.Reflection;
 using Marten.Events.Daemon;
 using Marten.Events.Daemon.Internals;
@@ -64,7 +62,10 @@ public abstract class CustomProjection<TDoc, TId>: ProjectionBase, IAggregationR
         {
             var tenantedSession = martenSession.UseTenancyBasedOnSliceAndStorage(storage, slice);
 
-            slice.Aggregate = await storage.LoadAsync(slice.Id, tenantedSession, cancellation).ConfigureAwait(false);
+            if (Slicer is not ISingleStreamSlicer || slice.ActionType != StreamActionType.Start)
+            {
+                slice.Aggregate = await storage.LoadAsync(slice.Id, tenantedSession, cancellation).ConfigureAwait(false);
+            }
             await ApplyChangesAsync(tenantedSession, slice, cancellation).ConfigureAwait(false);
         }
     }
