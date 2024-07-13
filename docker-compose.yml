@@ -9,3 +9,4 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_DB: marten_testing
       NAMEDATALEN: 100
+    command: ["postgres", "-c", "log_statement=all"]
