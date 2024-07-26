@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -59,6 +59,7 @@ public partial class EventGraph: IFeatureSchema
         yield return new ArchiveStreamFunction(this);
 
         yield return new QuickAppendEventFunction(this);
+        yield return new BulkQuickAppendEventFunction(this);
 
 
         foreach (var schemaSource in Options.Projections.All.OfType<IProjectionSchemaSource>())

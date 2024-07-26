@@ -18,7 +18,6 @@ using Marten.Internal.CodeGeneration;
 using Marten.Schema;
 using Marten.Storage;
 using Marten.Storage.Metadata;
-using Npgsql;
 using Weasel.Postgresql;
 
 namespace Marten.Events.CodeGeneration;
@@ -59,8 +58,7 @@ internal static class EventDocumentStorageGenerator
         buildSelectorMethods(options, builderType);
 
         buildAppendEventOperations(options, assembly, builderType);
-
-
+        
         buildInsertStream(builderType, assembly, options.EventGraph);
 
         buildStreamQueryHandlerType(options.EventGraph, assembly);
@@ -86,6 +84,11 @@ internal static class EventDocumentStorageGenerator
         var quickAppend = buildQuickAppendOperation(options.EventGraph, assembly);
         builderType.MethodFor(nameof(EventDocumentStorage.QuickAppendEvents))
             .Frames.ReturnNewGeneratedTypeObject(quickAppend, "stream");
+
+        var bulkQuickAppend = buildBulkQuickAppendOperation(options.EventGraph, assembly);
+        builderType.MethodFor(nameof(EventDocumentStorage.BulkQuickAppendEvents))
+            .Frames.ReturnNewGeneratedTypeObject(bulkQuickAppend, "streams");
+
     }
 
     private static void buildSelectorMethods(StoreOptions options, GeneratedType builderType)
@@ -338,6 +341,56 @@ internal static class EventDocumentStorageGenerator
         if (table.Columns.OfType<HeadersColumn>().Any())
         {
             configure.Frames.Code("writeHeaders(parameterBuilder, session);");
+        }
+
+        configure.Frames.AppendSql(')');
+
+        return operationType;
+    }
+
+    private static GeneratedType buildBulkQuickAppendOperation(EventGraph graph, GeneratedAssembly assembly)
+    {
+        var operationType = assembly.AddType("BulkQuickAppendEventsOperation", typeof(BulkQuickAppendEventsOperationBase));
+
+        var table = new EventsTable(graph);
+
+        var sql = $"select * from {graph.DatabaseSchemaName}.mt_bulk_quick_append_events(";
+
+        var configure = operationType.MethodFor(nameof(BulkQuickAppendEventsOperationBase.ConfigureCommand));
+        configure.DerivedVariables.Add(new Variable(typeof(IReadOnlyCollection<StreamAction>), nameof(BulkQuickAppendEventsOperationBase.Streams)));
+
+        configure.Frames.AppendSql(sql);
+
+        configure.Frames.Code($"var parameterBuilder = {{0}}.{nameof(CommandBuilder.CreateGroupedParameterBuilder)}(',');", Use.Type<ICommandBuilder>());
+
+        if (graph.StreamIdentity == StreamIdentity.AsGuid)
+        {
+            configure.Frames.Code("writeIds(parameterBuilder);");
+        }
+        else
+        {
+            configure.Frames.Code("writeKeys(parameterBuilder);");
+        }
+
+        configure.Frames.Code("writeBasicParameters(parameterBuilder, session);");
+
+        if (table.Columns.OfType<CausationIdColumn>().Any())
+        {
+            configure.Frames.Code("writeCausationIds(parameterBuilder);");
+        }
+
+        if (table.Columns.OfType<CorrelationIdColumn>().Any())
+        {
+            configure.Frames.Code("writeCorrelationIds(parameterBuilder);");
+        }
+
+        if (table.Columns.OfType<HeadersColumn>().Any())
+        {
+            configure.Frames.Code("writeHeaders(parameterBuilder, session);");
+        }
+        if (graph.TenancyStyle == TenancyStyle.Conjoined)
+        {
+            configure.Frames.Code("writeTenant(parameterBuilder);");
         }
 
         configure.Frames.AppendSql(')');

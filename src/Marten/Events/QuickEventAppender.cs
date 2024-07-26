@@ -32,12 +32,6 @@ internal class QuickEventAppender: IEventAppender
             if (stream.ActionType == StreamActionType.Start)
             {
                 stream.PrepareEvents(0, eventGraph, sequences, session);
-                session.QueueOperation(storage.InsertStream(stream));
-
-                foreach (var @event in stream.Events)
-                {
-                    session.QueueOperation(storage.QuickAppendEventWithVersion(eventGraph, session, stream, @event));
-                }
             }
             else
             {
@@ -45,18 +39,17 @@ internal class QuickEventAppender: IEventAppender
                 {
                     // We can supply the version to the events going in
                     stream.PrepareEvents(stream.ExpectedVersionOnServer.Value, eventGraph, sequences, session);
-                    session.QueueOperation(storage.UpdateStreamVersion(stream));
-                    foreach (var @event in stream.Events)
-                    {
-                        session.QueueOperation(storage.QuickAppendEventWithVersion(eventGraph, session, stream, @event));
-                    }
                 }
                 else
                 {
                     stream.PrepareEvents(0, eventGraph, sequences, session);
-                    session.QueueOperation(storage.QuickAppendEvents(stream));
                 }
             }
+        }
+
+        foreach (var streamsByTenant in session.WorkTracker.Streams.Where(x => x.Events.Any()).GroupBy(x => x.TenantId))
+        {
+            session.QueueOperation(storage.BulkQuickAppendEvents(streamsByTenant.ToList()));
         }
     }
 

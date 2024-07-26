@@ -11,7 +11,6 @@ using Marten.Events.Schema;
 using Marten.Exceptions;
 using Marten.Internal;
 using Marten.Internal.Operations;
-using Marten.Internal.Sessions;
 using Marten.Linq;
 using Marten.Linq.Members;
 using Marten.Linq.Parsing;
@@ -307,6 +306,12 @@ public abstract class EventDocumentStorage: IEventStorage
     }
 
     public virtual IStorageOperation QuickAppendEvents(StreamAction stream)
+    {
+        throw new NotSupportedException(
+            "You will have to re-generate the Marten code before the \"quick append events\" feature is available");
+    }
+
+    public virtual IStorageOperation BulkQuickAppendEvents(IReadOnlyCollection<StreamAction> streams)
     {
         throw new NotSupportedException(
             "You will have to re-generate the Marten code before the \"quick append events\" feature is available");

@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using Marten.Internal;
 using Marten.Internal.Operations;
 using Marten.Internal.Storage;
@@ -52,6 +53,7 @@ public interface IEventStorage: ISelector<IEvent>, IDocumentStorage<IEvent>
     IStorageOperation IncrementStreamVersion(StreamAction stream);
 
     IStorageOperation QuickAppendEvents(StreamAction stream);
+    IStorageOperation BulkQuickAppendEvents(IReadOnlyCollection<StreamAction> streams);
 
     IStorageOperation QuickAppendEventWithVersion(EventGraph events, IMartenSession session, StreamAction stream,
         IEvent e);
