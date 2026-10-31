@@ -93,6 +93,9 @@ internal class NaturalKeyFetchPlanner: IFetchPlanner
     /// </summary>
     internal static NaturalKeyDefinition? FindNaturalKey(IAggregateProjection projection, Type keyType)
     {
+        // A definition's OuterType is never Nullable<T>, so asking by TKey? finds the TKey key
+        keyType = NaturalKeyDefinition.KeyTypeOf(keyType);
+
         if (projection.NaturalKeyDefinition?.OuterType == keyType) return projection.NaturalKeyDefinition;
 
         return projection.MappedNaturalKeyDefinitions.FirstOrDefault(x => x.OuterType == keyType);

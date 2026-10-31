@@ -394,14 +394,15 @@ internal partial class EventStore: IEventIdentityStrategy<Guid>, IEventIdentityS
             return NaturalKeyFetchPlanner.FindNaturalKey(projection, typeof(TId)) != null;
         }
 
-        return FindNaturalKeyProperty<TDoc>()?.PropertyType == typeof(TId);
+        return FindNaturalKeyProperty<TDoc>() is { } property &&
+               NaturalKeyDefinition.KeyTypeOf(property.PropertyType) == NaturalKeyDefinition.KeyTypeOf(typeof(TId));
     }
 
     [UnconditionalSuppressMessage("Trimming", "IL2072",
         Justification = "Aggregate types reaching the fetch planners are preserved at the projection-registration boundary.")]
     private static PropertyInfo? FindNaturalKeyProperty<TDoc>() =>
         typeof(TDoc).GetProperties(BindingFlags.Public | BindingFlags.Instance)
-            .FirstOrDefault(p => p.GetCustomAttribute<NaturalKeyAttribute>() != null);
+            .FirstOrDefault(p => p.GetCustomAttribute<NaturalKeyAttribute>() is { SourceProjection: null });
 
     /// <summary>
     /// Auto-discovers a natural key from [NaturalKey] attribute on the aggregate type
@@ -421,7 +422,9 @@ internal partial class EventStore: IEventIdentityStrategy<Guid>, IEventIdentityS
 
         var naturalKeyProp = FindNaturalKeyProperty<TDoc>();
 
-        if (naturalKeyProp == null || naturalKeyProp.PropertyType != typeof(TId))
+        // TKey and TKey? are the same key
+        if (naturalKeyProp == null ||
+            NaturalKeyDefinition.KeyTypeOf(naturalKeyProp.PropertyType) != NaturalKeyDefinition.KeyTypeOf(typeof(TId)))
         {
             return false;
         }
