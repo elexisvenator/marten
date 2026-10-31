@@ -1,5 +1,8 @@
 using System;
+using System.Threading;
 using System.Threading.Tasks;
+using JasperFx.Core;
+using JasperFx.Events.Daemon;
 using JasperFx;
 using JasperFx.Events;
 using JasperFx.Events.Aggregation;
@@ -72,6 +75,54 @@ public class mapped_and_async_natural_keys: OneOffConfigurationsContext
         stream.Aggregate.ShouldNotBeNull();
         stream.Aggregate.TotalAmount.ShouldBe(9.99m);
         stream.CurrentVersion.ShouldBe(2);
+    }
+
+    [Fact]
+    public async Task an_async_aggregate_that_owns_its_key_keeps_its_lookup_through_the_daemon_and_a_rebuild()
+    {
+        StoreOptions(opts => opts.Projections.Snapshot<OrderAggregate>(SnapshotLifecycle.Async));
+        await theStore.Advanced.Clean.DeleteAllEventDataAsync();
+
+        var orderNumber = new OrderNumber("ASYNC-OWNED-REBUILD");
+        var streamId = Guid.NewGuid();
+        theSession.Events.StartStream<OrderAggregate>(streamId,
+            new OrderCreated(orderNumber, "Alice"),
+            new OrderItemAdded("Widget", 9.99m));
+        await theSession.SaveChangesAsync();
+
+        // The lookup row is written inline with the events, before any daemon runs
+        var lookupRows = $"select count(*) from {theStore.Options.Events.DatabaseSchemaName}.mt_natural_key_orderaggregate";
+        (await countAsync(lookupRows)).ShouldBe(1);
+        (await theSession.LoadAsync<OrderAggregate>(streamId)).ShouldBeNull();
+
+        using var daemon = await theStore.BuildProjectionDaemonAsync();
+        await daemon.StartAllAsync();
+        await daemon.WaitForNonStaleData(30.Seconds());
+        await daemon.StopAllAsync();
+
+        await using (var query = theStore.QuerySession())
+        {
+            (await query.LoadAsync<OrderAggregate>(streamId))!.OrderNum.ShouldBe(orderNumber);
+        }
+
+        await daemon.RebuildProjectionAsync<OrderAggregate>(CancellationToken.None);
+
+        (await countAsync(lookupRows)).ShouldBe(1);
+
+        await using var session = theStore.LightweightSession();
+        var latest = await session.Events.FetchLatest<OrderAggregate, OrderNumber>(orderNumber);
+        latest.ShouldNotBeNull();
+        latest.Id.ShouldBe(streamId);
+        latest.TotalAmount.ShouldBe(9.99m);
+    }
+
+    private async Task<long> countAsync(string sql)
+    {
+        await using var conn = theStore.Storage.Database.CreateConnection();
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        return (long)(await cmd.ExecuteScalarAsync())!;
     }
 
     [Fact]
