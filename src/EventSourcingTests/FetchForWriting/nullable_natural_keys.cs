@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 using JasperFx.Events;
 using JasperFx.Events.Aggregation;
@@ -131,6 +132,78 @@ public class nullable_natural_keys: OneOffConfigurationsContext
 
         (await theSession.Events.FetchLatest<Product, Sku>(original)).ShouldBeNull();
         (await theSession.Events.FetchLatest<Product, Sku>(renamed))!.Sku.ShouldBe(renamed);
+    }
+
+    [Fact]
+    public async Task setting_the_key_back_to_null_retires_it()
+    {
+        StoreOptions(opts => opts.Projections.Snapshot<Product>(SnapshotLifecycle.Inline));
+
+        var sku = new Sku("SKU-CLEARED");
+        var streamId = Guid.NewGuid();
+        theSession.Events.StartStream<Product>(streamId, new ProductListed(sku, "Sprocket"));
+        await theSession.SaveChangesAsync();
+
+        theSession.Events.Append(streamId, new ProductSkuChanged(null));
+        await theSession.SaveChangesAsync();
+
+        (await theSession.Events.FetchLatest<Product, Sku>(sku)).ShouldBeNull();
+        (await lookupRowsFor(streamId)).ShouldBe(0);
+
+        // The stream can take a key again
+        var next = new Sku("SKU-AGAIN");
+        theSession.Events.Append(streamId, new ProductSkuChanged(next));
+        await theSession.SaveChangesAsync();
+
+        (await theSession.Events.FetchLatest<Product, Sku>(next))!.Id.ShouldBe(streamId);
+    }
+
+    [Fact]
+    public async Task a_retired_key_can_be_claimed_by_another_stream()
+    {
+        StoreOptions(opts => opts.Projections.Snapshot<Product>(SnapshotLifecycle.Inline));
+
+        var sku = new Sku("SKU-FREED");
+        var first = Guid.NewGuid();
+        theSession.Events.StartStream<Product>(first, new ProductListed(sku, "First"));
+        await theSession.SaveChangesAsync();
+
+        theSession.Events.Append(first, new ProductSkuChanged(null));
+        await theSession.SaveChangesAsync();
+
+        var second = Guid.NewGuid();
+        theSession.Events.StartStream<Product>(second, new ProductListed(sku, "Second"));
+        await theSession.SaveChangesAsync();
+
+        (await theSession.Events.FetchLatest<Product, Sku>(sku))!.Id.ShouldBe(second);
+    }
+
+    [Fact]
+    public async Task a_rebuild_leaves_a_cleared_key_retired()
+    {
+        StoreOptions(opts => opts.Projections.Snapshot<Product>(SnapshotLifecycle.Inline));
+        await theStore.Advanced.Clean.DeleteAllEventDataAsync();
+
+        var sku = new Sku("SKU-REBUILT");
+        var streamId = Guid.NewGuid();
+        theSession.Events.StartStream<Product>(streamId, new ProductListed(sku, "Cog"), new ProductSkuChanged(null));
+        await theSession.SaveChangesAsync();
+
+        using var daemon = await theStore.BuildProjectionDaemonAsync();
+        await daemon.RebuildProjectionAsync<Product>(CancellationToken.None);
+
+        (await lookupRowsFor(streamId)).ShouldBe(0);
+        (await theSession.Events.FetchLatest<Product, Sku>(sku)).ShouldBeNull();
+    }
+
+    private async Task<long> lookupRowsFor(Guid streamId)
+    {
+        await using var conn = theStore.Storage.Database.CreateConnection();
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText =
+            $"select count(*) from {theStore.Options.Events.DatabaseSchemaName}.mt_natural_key_product where stream_id = '{streamId}'";
+        return (long)(await cmd.ExecuteScalarAsync())!;
     }
 
     [Fact]
