@@ -88,6 +88,7 @@ public partial class DocumentStore: IDocumentStore, IDescribeMyself
         // removed because it caused spurious InvalidProjectionException failures
         // when test projects share compile references with incompatible stream identity types.
         Options.Projections.AssertValidity(Options);
+        Options.Projections.AssertMappedNaturalKeysAgreeOnGlobalTenancy();
 
         if (Options.LogFactory != null)
         {

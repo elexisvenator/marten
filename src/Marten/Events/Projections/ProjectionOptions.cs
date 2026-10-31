@@ -421,6 +421,30 @@ public class ProjectionOptions: ProjectionGraph<IProjection, IDocumentOperations
     }
 
     /// <summary>
+    /// A mapped natural key reads its source's lookup table, which is tenanted the way the source aggregate
+    /// is. Both aggregates project the same stream, so one global and the other not cannot both be right.
+    /// Runs after <see cref="ProjectionGraph{TProjection,TOperations,TQuerySession}.AssertValidity{T}"/>
+    /// has resolved each mapped key's source.
+    /// </summary>
+    internal void AssertMappedNaturalKeysAgreeOnGlobalTenancy()
+    {
+        var globals = _options.EventGraph.GlobalAggregates;
+        var messages = AllAggregateProjections()
+            .SelectMany(aggregate => aggregate.MappedNaturalKeyDefinitions
+                .Where(x => x.SourceProjectionDefinition != null)
+                .Where(x => globals.Contains(aggregate.AggregateType) !=
+                            globals.Contains(x.SourceProjectionDefinition!.AggregateType))
+                .Select(x =>
+                    $"Mapped natural key {aggregate.AggregateType.FullNameInCode()}.{x.Member.Name} reads the lookup of {x.SourceProjectionDefinition!.AggregateType.FullNameInCode()}, but only one of the two is a global aggregate. Make both global or neither."))
+            .ToArray();
+
+        if (messages.Length > 0)
+        {
+            throw new InvalidProjectionException(messages);
+        }
+    }
+
+    /// <summary>
     /// Find a registered natural key definition for the given aggregate type, if any.
     /// </summary>
     public NaturalKeyDefinition? FindNaturalKeyDefinition(Type aggregateType)

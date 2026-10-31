@@ -391,7 +391,7 @@ internal partial class EventStore: IEventIdentityStrategy<Guid>, IEventIdentityS
 
         if (options.Projections.TryFindAggregate(typeof(TDoc), out var projection))
         {
-            return projection.NaturalKeyDefinition?.OuterType == typeof(TId);
+            return NaturalKeyFetchPlanner.FindNaturalKey(projection, typeof(TId)) != null;
         }
 
         return FindNaturalKeyProperty<TDoc>()?.PropertyType == typeof(TId);
