@@ -78,7 +78,7 @@ internal partial class FetchAsyncPlan<TDoc, TId>
     ///     and the retry budget is spent discovering nothing. Scoped to the one id -- EjectAllOfType would
     ///     also throw away other streams' identity and any pending work queued against the type.
     /// </remarks>
-    private static void forgetSnapshot(DocumentSessionBase session, TId id)
+    internal static void forgetSnapshot(DocumentSessionBase session, TId id)
     {
         if (session.ItemMap.TryGetValue(typeof(TDoc), out var raw) && raw is Dictionary<TId, TDoc> map)
         {
@@ -209,7 +209,7 @@ internal partial class FetchAsyncPlan<TDoc, TId>
     ///         actually happens when the daemon is running, always lands here with an empty delta.
     ///     </para>
     /// </remarks>
-    private static bool snapshotAndDeltaDisagree(DocumentSessionBase session, TId id, long version,
+    internal static bool snapshotAndDeltaDisagree(DocumentSessionBase session, TId id, long version,
         TDoc? document, IReadOnlyList<IEvent> events)
     {
         // A delta with events in it tells us nothing we can safely act on -- see the remarks above.

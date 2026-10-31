@@ -2,12 +2,16 @@ using JasperFx.Events;
 using Marten.Events.Schema;
 using Marten.Storage;
 using Weasel.Postgresql;
+using Weasel.Postgresql.SqlGeneration;
 
 namespace Marten.Events.Fetching;
 
 /// <summary>
 /// Writes the SQL that resolves a natural key to its stream, against the lookup table of the aggregate
-/// that owns the key.
+/// that owns the key, in the two shapes a single batched fetch needs: a JOIN that reads the stream's
+/// version and identity, and a subselect that stands in for the stream id in the document and event reads.
+/// Every statement resolves the key for itself, so a fetch by natural key is one round trip and can sit in
+/// a batch query like any other.
 /// </summary>
 internal class NaturalKeyQueryBuilder
 {
@@ -31,12 +35,38 @@ internal class NaturalKeyQueryBuilder
     }
 
     /// <summary>
-    /// <c>select stream id from the lookup where the key matches</c>, for a stream that is not archived.
+    /// <c>select s.version, nk.stream_id</c> for the key's live stream. No row means no stream has the key.
     /// </summary>
-    public void WriteStreamLookup(ICommandBuilder builder, object innerValue)
+    public void WriteVersionAndStreamId(ICommandBuilder builder, object keyValue, bool forUpdate)
     {
-        builder.Append("select nk.");
+        builder.Append("select s.version, nk.");
         builder.Append(_streamIdColumn);
+        writeFromAndWhere(builder, keyValue);
+
+        if (forUpdate)
+        {
+            builder.Append(" for update of s");
+        }
+    }
+
+    /// <summary>
+    /// <c>(select nk.stream_id ...)</c>, to compare a stream id column against.
+    /// </summary>
+    public void WriteStreamIdSubselect(ICommandBuilder builder, object keyValue)
+    {
+        builder.Append("(select nk.");
+        builder.Append(_streamIdColumn);
+        writeFromAndWhere(builder, keyValue);
+        builder.Append(')');
+    }
+
+    /// <summary>
+    /// <c>d.stream_id = (select ...)</c>, for an <see cref="EventStatement"/>.
+    /// </summary>
+    public ISqlFragment StreamIdFilter(object keyValue) => new StreamIdMatchesKey(this, keyValue);
+
+    private void writeFromAndWhere(ICommandBuilder builder, object keyValue)
+    {
         builder.Append(" from ");
         builder.Append(_tableName);
         builder.Append(" nk inner join ");
@@ -52,7 +82,7 @@ internal class NaturalKeyQueryBuilder
         }
 
         builder.Append(" where nk.natural_key_value = ");
-        builder.AppendParameter(innerValue);
+        builder.AppendParameter(keyValue);
         builder.Append(" and nk.is_archived = false");
 
         // #5344: archival is a property of the *stream*, and nothing on the write side copies it onto the
@@ -66,6 +96,24 @@ internal class NaturalKeyQueryBuilder
         {
             builder.Append(" and nk.tenant_id = ");
             builder.AppendParameter(builder.TenantId);
+        }
+    }
+
+    private sealed class StreamIdMatchesKey: ISqlFragment
+    {
+        private readonly NaturalKeyQueryBuilder _parent;
+        private readonly object _keyValue;
+
+        public StreamIdMatchesKey(NaturalKeyQueryBuilder parent, object keyValue)
+        {
+            _parent = parent;
+            _keyValue = keyValue;
+        }
+
+        public void Apply(ICommandBuilder builder)
+        {
+            builder.Append("d.stream_id = ");
+            _parent.WriteStreamIdSubselect(builder, _keyValue);
         }
     }
 }

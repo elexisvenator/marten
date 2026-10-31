@@ -5,6 +5,9 @@ using JasperFx.Core.Reflection;
 using JasperFx.Events;
 using JasperFx.Events.Aggregation;
 using JasperFx.Events.Projections;
+using Marten.Exceptions;
+using Marten.Internal.Storage;
+using Marten.Schema;
 
 namespace Marten.Events.Fetching;
 
@@ -38,13 +41,50 @@ internal class NaturalKeyFetchPlanner: IFetchPlanner
             var builder = new NaturalKeyQueryBuilder(options.EventGraph, lookup);
 
             plan = options.EventGraph.StreamIdentity == StreamIdentity.AsGuid
-                ? new FetchNaturalKeyPlan<TDoc, TId, Guid>(naturalKey, builder, projection.Lifecycle)
-                : new FetchNaturalKeyPlan<TDoc, TId, string>(naturalKey, builder, projection.Lifecycle);
+                ? buildPlan<TDoc, TId, Guid>(options, projection, naturalKey, builder)
+                : buildPlan<TDoc, TId, string>(options, projection, naturalKey, builder);
             return true;
         }
 
         plan = null;
         return false;
+    }
+
+    /// <summary>
+    /// The same choice of lifecycle plan as the Inline, Async and Live planners make for a stream id. An Async
+    /// aggregate without revision metadata is fetched by the Live plan there, so it is here too.
+    /// </summary>
+    private static IAggregateFetchPlan<TDoc, TNaturalKey> buildPlan<TDoc, TNaturalKey, TStreamId>(
+        StoreOptions options, IAggregateProjection projection, NaturalKeyDefinition naturalKey,
+        NaturalKeyQueryBuilder builder)
+        where TDoc : class where TNaturalKey : notnull where TStreamId : notnull
+    {
+        var events = options.EventGraph;
+
+        if (projection.Lifecycle == ProjectionLifecycle.Inline)
+        {
+            return new FetchNaturalKeyInlinePlan<TDoc, TNaturalKey, TStreamId>(events, naturalKey, builder);
+        }
+
+        if (projection.Lifecycle == ProjectionLifecycle.Async &&
+            options.Storage.FindMapping(typeof(TDoc)) is DocumentMapping { Metadata.Revision.Enabled: true })
+        {
+            return new FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TStreamId>(events, naturalKey, builder,
+                options.ResolveCorrectedDocumentStorage<TDoc, TStreamId>(DocumentTracking.IdentityOnly));
+        }
+
+        IIdentitySetter<TDoc, TStreamId> identitySetter = new NulloIdentitySetter<TDoc, TStreamId>();
+        try
+        {
+            identitySetter = options.ResolveCorrectedDocumentStorage<TDoc, TStreamId>(DocumentTracking.IdentityOnly);
+        }
+        catch (InvalidDocumentException)
+        {
+            // there's no identity, just use the nullo strategy
+        }
+
+        return new FetchNaturalKeyLivePlan<TDoc, TNaturalKey, TStreamId>(events, naturalKey, builder,
+            identitySetter);
     }
 
     /// <summary>
