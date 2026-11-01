@@ -157,4 +157,33 @@ public class batch_querying_by_natural_key: OneOffConfigurationsContext
         session.RequestCount.ShouldBe(before + 1);
         stream.Aggregate!.Items.ShouldBe(1);
     }
+
+    [Fact]
+    public async Task async_fetches_by_natural_key_share_the_start_of_a_batch()
+    {
+        configure();
+
+        var first = new OrderNumber("BATCH-SHARED-1");
+        var second = new OrderNumber("BATCH-SHARED-2");
+        var firstId = await startOrder(first, 1);
+        var secondId = await startOrder(second, 2);
+
+        await using var session = theStore.LightweightSession();
+        var before = session.RequestCount;
+
+        // Both bracket their reads, so they share one bracket at the start of the batch
+        var batch = session.CreateBatchQuery();
+        var writing = batch.Events.FetchForWriting<OrderSummary, OrderNumber>(first);
+        var latest = batch.Events.FetchLatest<OrderSummary, OrderNumber>(second);
+        var owner = batch.Events.FetchLatest<OrderAggregate, OrderNumber>(second);
+        await batch.Execute();
+
+        session.RequestCount.ShouldBe(before + 1);
+
+        var stream = await writing;
+        stream.Id.ShouldBe(firstId);
+        stream.Aggregate!.Items.ShouldBe(1);
+        (await latest)!.Items.ShouldBe(2);
+        (await owner)!.Id.ShouldBe(secondId);
+    }
 }

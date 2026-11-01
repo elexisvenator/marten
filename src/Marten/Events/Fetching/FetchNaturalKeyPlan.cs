@@ -563,6 +563,8 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
         /// </summary>
         public bool OpensItsOwnTransaction => _sharedSnapshot;
 
+        public bool BracketedByBatch { get; set; }
+
         public string CallName => "FetchForWriting";
 
         public void ConfigureCommand(ICommandBuilder builder, IStorageSession session)
@@ -571,7 +573,7 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
             // acquire a transaction between enlistment and Execute().
             var querySession = (QuerySession)session;
             _parent.writeFetch(builder, querySession, _parent.keyValueFor(_id), _forUpdate,
-                !_forUpdate && _parent.sharesOneSnapshot(querySession), null);
+                !_forUpdate && !BracketedByBatch && _parent.sharesOneSnapshot(querySession), null);
         }
 
         public async Task<IEventStream<TDoc>> HandleAsync(DbDataReader reader, IStorageSession session,
@@ -624,13 +626,15 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
         /// </summary>
         public bool OpensItsOwnTransaction => _sharedSnapshot;
 
+        public bool BracketedByBatch { get; set; }
+
         public string CallName => "FetchLatest";
 
         public void ConfigureCommand(ICommandBuilder builder, IStorageSession session)
         {
             var querySession = (QuerySession)session;
             _parent.writeFetch(builder, querySession, _parent.keyValueFor(_id), false,
-                _parent.sharesOneSnapshot(querySession), null);
+                !BracketedByBatch && _parent.sharesOneSnapshot(querySession), null);
         }
 
         public async Task<TDoc?> HandleAsync(DbDataReader reader, IStorageSession session, CancellationToken token)
