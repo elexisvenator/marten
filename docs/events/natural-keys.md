@@ -278,6 +278,23 @@ await theSession.SaveChangesAsync();
 
 This resolves the natural key to a stream id and fetches the aggregate in a single database round-trip.
 
+### Expected Version
+
+As with a stream id, you can pass the version you expect the stream to be at. The fetch fails immediately
+with a `ConcurrencyException` if the stream has moved on:
+
+<!-- snippet: sample_fetch_for_writing_by_natural_key_with_expected_version -->
+<a id='snippet-sample_fetch_for_writing_by_natural_key_with_expected_version'></a>
+```cs
+var stream = await session.Events.FetchForWriting<OrderAggregate, OrderNumber>(order, 3);
+```
+<sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/natural_key_expected_version.cs#L45-L47' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_fetch_for_writing_by_natural_key_with_expected_version' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+A natural key that doesn't match any stream is at version 0. The same overload exists on batch queries,
+`batch.Events.FetchForWriting<T, TNaturalKey>(key, expectedVersion)`. It also works with a strong-typed
+identifier or the stream id itself, because `TId` is any identity the aggregate can be fetched by.
+
 ## FetchLatest by Natural Key
 
 For read-only access, you can use `FetchLatest` with a natural key:

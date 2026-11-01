@@ -146,6 +146,15 @@ public interface IBatchEvents
     Task<IEventStream<T>> FetchForWriting<T, TId>(TId id) where T : class where TId : notnull;
 
     /// <summary>
+    ///     Fetch the projected aggregate T by an identity of type <typeparamref name="TId" /> and expected,
+    ///     current version of the aggregate: a natural key, a strong-typed identifier, or the stream id itself.
+    ///     Will fail immediately with ConcurrencyException if the expectedVersion is stale. Builds in optimistic
+    ///     concurrency for later
+    /// </summary>
+    Task<IEventStream<T>> FetchForWriting<T, TId>(TId id, long expectedVersion)
+        where T : class where TId : notnull;
+
+    /// <summary>
     ///     Fetch the projected aggregate T by an identity of type <typeparamref name="TId" /> for exclusive
     ///     writing: a natural key, a strong-typed identifier, or the stream id itself.
     /// </summary>

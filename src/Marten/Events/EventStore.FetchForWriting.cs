@@ -166,6 +166,14 @@ internal partial class EventStore: IEventIdentityStrategy<Guid>, IEventIdentityS
         return plan.FetchForWriting(_session, id, false, cancellation);
     }
 
+    public Task<IEventStream<T>> FetchForWriting<T, TId>(TId id, long expectedVersion,
+        CancellationToken cancellation = default)
+        where T : class where TId : notnull
+    {
+        var plan = FindFetchPlan<T, TId>();
+        return plan.FetchForWriting(_session, id, expectedVersion, cancellation);
+    }
+
     public Task<IEventStream<T>> FetchForExclusiveWriting<T, TId>(TId id, CancellationToken cancellation = default)
         where T : class where TId : notnull
     {

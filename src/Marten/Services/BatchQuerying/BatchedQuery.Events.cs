@@ -200,6 +200,13 @@ internal partial class BatchedQuery: IBatchEvents
         return AddItem(plan.BuildQueryHandler(Parent, id, false));
     }
 
+    public Task<IEventStream<T>> FetchForWriting<T, TId>(TId id, long expectedVersion)
+        where T : class where TId : notnull
+    {
+        var plan = enlistFetchPlan<T, TId>();
+        return AddItem(plan.BuildQueryHandler(Parent, id, expectedVersion));
+    }
+
     public async Task<IEventStream<T>> FetchForExclusiveWriting<T, TId>(TId id) where T : class where TId : notnull
     {
         // See FetchForExclusiveWriting<T>(Guid) for why the transaction is started without being awaited.
