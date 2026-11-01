@@ -224,7 +224,7 @@ public class Bug_5604_expected_version_fetch_needs_one_snapshot: OneOffConfigura
         var ex = Should.Throw<InvalidOperationException>(() =>
             batch.Events.FetchForWriting<SimpleAggregate>(id, 3));
 
-        ex.Message.ShouldContain("has to be the FIRST operation in its batch");
+        ex.Message.ShouldContain("has to come before every other kind of operation in its batch");
         ex.Message.ShouldContain("SimpleAggregate");
     }
 

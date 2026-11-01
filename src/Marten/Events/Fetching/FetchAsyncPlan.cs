@@ -108,7 +108,7 @@ internal partial class FetchAsyncPlan<TDoc, TId>: IAggregateFetchPlan<TDoc, TId>
     /// </remarks>
     private static bool canShareOneSnapshot(QuerySession session)
     {
-        return !session.HasSurvivingTransaction;
+        return SharedSnapshotBracket.CanShare(session);
     }
 
     /// <summary>
@@ -125,7 +125,7 @@ internal partial class FetchAsyncPlan<TDoc, TId>: IAggregateFetchPlan<TDoc, TId>
     {
         if (!canShareOneSnapshot(session)) return false;
 
-        builder.Append("begin transaction isolation level repeatable read read only");
+        builder.Append(SharedSnapshotBracket.Begin);
         builder.StartNewCommand();
         return true;
     }
@@ -140,7 +140,7 @@ internal partial class FetchAsyncPlan<TDoc, TId>: IAggregateFetchPlan<TDoc, TId>
         if (!opened) return;
 
         builder.StartNewCommand();
-        builder.Append("end");
+        builder.Append(SharedSnapshotBracket.End);
     }
 
     private void writeEventFetchStatement(TId id,

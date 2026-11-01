@@ -215,6 +215,8 @@ internal partial class FetchAsyncPlan<TDoc, TId>
         /// </summary>
         public bool OpensItsOwnTransaction => _sharedSnapshot;
 
+        public bool BracketedByBatch { get; set; }
+
         public string CallName => "FetchLatest";
 
         public QueryHandler(FetchAsyncPlan<TDoc, TId> parent, TId id, bool sharedSnapshot)
@@ -229,7 +231,7 @@ internal partial class FetchAsyncPlan<TDoc, TId>
         public void ConfigureCommand(ICommandBuilder builder, IStorageSession session)
         {
             // Asked again here rather than reusing _sharedSnapshot -- see ForUpdateQueryHandler for why.
-            var sharedSnapshot = beginSharedSnapshot(builder, (QuerySession)session);
+            var sharedSnapshot = !BracketedByBatch && beginSharedSnapshot(builder, (QuerySession)session);
 
             _loadHandler.ConfigureCommand(builder, session);
 

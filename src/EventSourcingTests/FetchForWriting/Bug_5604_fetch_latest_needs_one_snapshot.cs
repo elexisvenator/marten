@@ -225,7 +225,7 @@ public class Bug_5604_fetch_latest_needs_one_snapshot: OneOffConfigurationsConte
 
         var ex = Should.Throw<InvalidOperationException>(() => batch.Events.FetchLatest<SimpleAggregate>(id));
 
-        ex.Message.ShouldContain("has to be the FIRST operation in its batch");
+        ex.Message.ShouldContain("has to come before every other kind of operation in its batch");
         ex.Message.ShouldContain("FetchLatest");
         ex.Message.ShouldContain("SimpleAggregate");
     }

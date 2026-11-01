@@ -157,6 +157,8 @@ internal partial class FetchAsyncPlan<TDoc, TId>
         /// </summary>
         public bool OpensItsOwnTransaction => _sharedSnapshot;
 
+        public bool BracketedByBatch { get; set; }
+
         public string CallName => "FetchForWriting";
 
         public ExpectedVersionQueryHandler(FetchAsyncPlan<TDoc,TId> parent, TId id, long expectedStartingVersion,
@@ -173,7 +175,7 @@ internal partial class FetchAsyncPlan<TDoc, TId>
         public void ConfigureCommand(ICommandBuilder builder, IStorageSession session)
         {
             // Asked again here rather than reusing _sharedSnapshot -- see ForUpdateQueryHandler for why.
-            var sharedSnapshot = beginSharedSnapshot(builder, (QuerySession)session);
+            var sharedSnapshot = !BracketedByBatch && beginSharedSnapshot(builder, (QuerySession)session);
 
             _parent._identityStrategy.BuildCommandForReadingVersionForStream(_parent.IsGlobal, builder, _id, false);
 
