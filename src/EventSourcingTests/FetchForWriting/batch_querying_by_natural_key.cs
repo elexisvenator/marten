@@ -50,7 +50,7 @@ public class batch_querying_by_natural_key: OneOffConfigurationsContext
         #region sample_batch_fetch_by_natural_key
         var batch = session.CreateBatchQuery();
 
-        // The async fetch brackets its reads in its own transaction, so it has to come first
+        // The async fetch brackets its reads in a transaction, so it comes before anything else
         var summary = batch.Events.FetchLatest<OrderSummary, OrderNumber>(order);
         var owner = batch.Events.FetchLatest<OrderAggregate, OrderNumber>(order);
         var byStreamId = batch.Events.FetchLatest<OrderAggregate>(orderId);

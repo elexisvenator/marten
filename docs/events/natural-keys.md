@@ -402,7 +402,7 @@ fetch resolves its key inside the batch, so the whole batch is still one round t
 ```cs
 var batch = session.CreateBatchQuery();
 
-// The async fetch brackets its reads in its own transaction, so it has to come first
+// The async fetch brackets its reads in a transaction, so it comes before anything else
 var summary = batch.Events.FetchLatest<OrderSummary, OrderNumber>(order);
 var owner = batch.Events.FetchLatest<OrderAggregate, OrderNumber>(order);
 var byStreamId = batch.Events.FetchLatest<OrderAggregate>(orderId);
@@ -416,8 +416,29 @@ await batch.Execute();
 <!-- endSnippet -->
 
 The ordinary batch rules apply. A fetch of an `Async` aggregate reads its snapshot and the events after it
-inside a transaction of its own. So it has to be the first item in the batch, and it cannot share a batch
-with `FetchForExclusiveWriting`.
+inside a `repeatable read` transaction, which PostgreSQL only accepts as a transaction's first statement. So
+these fetches come before anything else in the batch, where they all share one such transaction and one
+snapshot, and they cannot share a batch with `FetchForExclusiveWriting`.
+
+## FetchManyForWriting by Natural Key
+
+`FetchManyForWriting<T, TKey>` fetches several streams for writing in one round trip, by a natural key, a
+strong-typed identifier or the stream id itself:
+
+<!-- snippet: sample_fetch_many_for_writing_by_natural_key -->
+<a id='snippet-sample_fetch_many_for_writing_by_natural_key'></a>
+```cs
+var streams = await session.Events.FetchManyForWriting<OrderAggregate, OrderNumber>([first, second]);
+```
+<sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/natural_key_fetch_many_for_writing.cs#L47-L49' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_fetch_many_for_writing_by_natural_key' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+- The handles come back in the order of the keys, each with its own starting version.
+- A key that matches no stream gets a handle with a null aggregate at version 0, as a single
+  `FetchForWriting` would: appending starts the stream.
+- A repeated key is refused, because two handles on one stream would race each other's expected version.
+- The keys are `TKey`, never `TKey?`, and none may be null. Drop the keys you know to be missing first.
+- An `Async` aggregate's fetches share one snapshot.
 
 ## Mutability
 

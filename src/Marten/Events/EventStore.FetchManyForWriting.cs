@@ -42,6 +42,46 @@ internal partial class EventStore
             (batch, key) => batch.Events.FetchForWriting<T>(key),
             key => FetchForWriting<T>(key, cancellation), cancellation);
 
+    /// <summary>
+    ///     The many-stream form of <see cref="FetchForWriting{T, TId}(TId, CancellationToken)" />: by a natural
+    ///     key, a strong-typed identifier or the stream id itself, in one round trip. A natural key is resolved
+    ///     inside the batch, and an Async aggregate's fetches share one snapshot.
+    /// </summary>
+    /// <remarks>
+    ///     An id that matches no stream comes back as a handle with a null aggregate at version 0, as a single
+    ///     <c>FetchForWriting</c> by that id would: appending starts the stream.
+    /// </remarks>
+    /// <exception cref="ArgumentException">
+    ///     When <paramref name="ids" /> repeats an id, or <typeparamref name="TId" /> is <c>Nullable&lt;T&gt;</c>.
+    /// </exception>
+    /// <exception cref="ArgumentNullException">When an id is null.</exception>
+    public Task<IReadOnlyList<IEventStream<T>>> FetchManyForWriting<T, TId>(IReadOnlyList<TId> ids,
+        CancellationToken cancellation = default) where T : class where TId : notnull
+    {
+        // Ahead of the empty-list shortcut, so a TKey? call is refused whatever it is given, as
+        // FetchForWriting<T, TKey?> is
+        if (Nullable.GetUnderlyingType(typeof(TId)) is { } underlying)
+        {
+            throw new ArgumentException(
+                $"{typeof(T).Name} cannot be fetched by {typeof(TId).Name}. Fetch by {underlying.Name} instead, and drop the null ids before fetching.",
+                nameof(ids));
+        }
+
+        ArgumentNullException.ThrowIfNull(ids, nameof(ids));
+        for (var i = 0; i < ids.Count; i++)
+        {
+            if (ids[i] is null)
+            {
+                throw new ArgumentNullException(nameof(ids),
+                    $"{nameof(FetchManyForWriting)} was given a null id at position {i}. Drop the null ids before fetching.");
+            }
+        }
+
+        return fetchManyForWritingAsync<T, TId>(ids, nameof(ids),
+            (batch, id) => batch.Events.FetchForWriting<T, TId>(id),
+            id => FetchForWriting<T, TId>(id, cancellation), cancellation);
+    }
+
     private async Task<IReadOnlyList<IEventStream<T>>> fetchManyForWritingAsync<T, TId>(
         IReadOnlyList<TId> identities,
         string parameterName,
