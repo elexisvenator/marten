@@ -395,6 +395,8 @@ internal partial class FetchAsyncPlan<TDoc, TId>
         /// </summary>
         public bool OpensItsOwnTransaction => _sharedSnapshot;
 
+        public bool BracketedByBatch { get; set; }
+
         public string CallName => "FetchForWriting";
 
         public ForUpdateQueryHandler(FetchAsyncPlan<TDoc,TId> parent, TId id, bool forUpdate, bool sharedSnapshot)
@@ -412,7 +414,7 @@ internal partial class FetchAsyncPlan<TDoc, TId>
             // between enlistment and Execute(), and this is the last moment before the SQL goes out. The
             // enlistment-time answer only has to be good enough for the batch's own rules; this one has to
             // be right.
-            var sharedSnapshot = !_forUpdate && beginSharedSnapshot(builder, (QuerySession)session);
+            var sharedSnapshot = !_forUpdate && !BracketedByBatch && beginSharedSnapshot(builder, (QuerySession)session);
 
             _parent._identityStrategy.BuildCommandForReadingVersionForStream(_parent.IsGlobal, builder, _id, _forUpdate);
 

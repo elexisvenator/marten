@@ -203,7 +203,7 @@ public class batched_exclusive_fetch_followups: OneOffConfigurationsContext
         var ex = Should.Throw<InvalidOperationException>(
             () => batch.Events.FetchForWriting<SimpleAggregate>(streamId));
 
-        ex.Message.ShouldContain("FIRST operation in its batch");
+        ex.Message.ShouldContain("has to come before every other kind of operation in its batch");
         ex.Message.ShouldContain("repeatable read read only");
     }
 

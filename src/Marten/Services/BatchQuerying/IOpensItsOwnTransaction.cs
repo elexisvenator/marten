@@ -5,6 +5,8 @@ namespace Marten.Services.BatchQuerying;
 /// <summary>
 ///     Marks a batch query handler that brackets its own SQL in <c>begin transaction … end</c>, and so
 ///     cannot share a batch with anything that depends on the session's transaction surviving the batch.
+///     Several of them can share a batch when they all come first in it: the batch then writes one bracket
+///     around all of them.
 /// </summary>
 /// <remarks>
 ///     Implemented by the three <c>FetchAsyncPlan</c> handlers that emit
@@ -22,6 +24,14 @@ internal interface IOpensItsOwnTransaction
 {
     /// <summary>True when this handler's SQL will open and commit its own transaction.</summary>
     bool OpensItsOwnTransaction { get; }
+
+    /// <summary>
+    ///     Set by the batch when it writes one bracket around every bracketed handler at its start, so this
+    ///     handler writes none of its own. Two brackets in one batch fail, because only the first statement
+    ///     of a transaction may set its isolation level, and sharing one also gives every one of those
+    ///     fetches the same snapshot.
+    /// </summary>
+    bool BracketedByBatch { get; set; }
 
     /// <summary>
     ///     The call the user actually wrote — <c>FetchForWriting</c> or <c>FetchLatest</c> — for the

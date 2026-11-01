@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using JasperFx.Core.Reflection;
+using Marten.Events.Fetching;
 using Marten.Exceptions;
 using Marten.Internal;
 using Marten.Internal.Sessions;
@@ -13,6 +14,8 @@ using Marten.Linq.Parsing;
 using Marten.Linq.QueryHandlers;
 using Marten.Util;
 using System.Diagnostics.CodeAnalysis;
+using Npgsql;
+using Weasel.Postgresql;
 
 namespace Marten.Services.BatchQuerying;
 
@@ -33,6 +36,10 @@ internal partial class BatchedQuery: IBatchedQuery
     // handler COMMITS the session's transaction when its `end` runs, so it cannot share a batch with
     // an exclusive fetch, whose row lock has to survive until SaveChangesAsync. See assertNoTransactionConflict.
     private bool _holdsSelfTransactingItem;
+
+    // The self-transacting items, which can only be the items at the start of the batch. When there is more
+    // than one, Execute() writes one bracket around all of them instead of one each. See AddItem.
+    private readonly List<IOpensItsOwnTransaction> _leadingSelfTransacting = new();
 
     // The call that the self-transacting item in this batch came from, for MixedBatchMessage. Kept
     // beside _holdsSelfTransactingItem because assertNoTransactionConflict() fires from the other
@@ -202,7 +209,7 @@ internal partial class BatchedQuery: IBatchedQuery
         foreach (var type in _documentTypes.Distinct())
             await Parent.Database.EnsureStorageExistsAsync(type, token).ConfigureAwait(false);
 
-        var command = Parent.BuildCommand(_items.Select(x => x.Handler));
+        var command = buildCommand();
 
         await using var reader = await Parent.ExecuteReaderAsync(command, token).ConfigureAwait(false);
         await _items[0].ReadAsync(reader, Parent, token).ConfigureAwait(false);
@@ -219,6 +226,42 @@ internal partial class BatchedQuery: IBatchedQuery
 
             await _items[i].ReadAsync(reader, Parent, token).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    ///     One command for every item. More than one self-transacting item at the start shares one
+    ///     <c>begin transaction isolation level repeatable read read only</c> … <c>end</c>, written here
+    ///     around all of them; a single one keeps writing its own, so its SQL is unchanged.
+    /// </summary>
+    private NpgsqlBatch buildCommand()
+    {
+        // Decided now rather than at enlistment, as the handlers decide for themselves: the session can
+        // acquire a transaction in between, and then there is no bracket to write at all (#5611)
+        var shared = _leadingSelfTransacting.Count > 1 && SharedSnapshotBracket.CanShare(Parent);
+        foreach (var handler in _leadingSelfTransacting)
+        {
+            handler.BracketedByBatch = shared;
+        }
+
+        var builder = new BatchBuilder { TenantId = Parent.TenantId };
+        if (shared)
+        {
+            builder.Append(SharedSnapshotBracket.Begin);
+        }
+
+        for (var i = 0; i < _items.Count; i++)
+        {
+            builder.StartNewCommand();
+            _items[i].Handler.ConfigureCommand(builder, Parent);
+
+            if (shared && i == _leadingSelfTransacting.Count - 1)
+            {
+                builder.StartNewCommand();
+                builder.Append(SharedSnapshotBracket.End);
+            }
+        }
+
+        return builder.Compile();
     }
 
     public Task<TResult> Query<TDoc, TResult>(ICompiledQuery<TDoc, TResult> query) where TDoc : class
@@ -248,21 +291,27 @@ internal partial class BatchedQuery: IBatchedQuery
             assertNoTransactionConflict();
 
             // #5535. `begin transaction isolation level repeatable read read only` is only legal as the
-            // FIRST statement in a transaction, so this handler can only be the first item in its batch.
-            // Enlisted after anything else it failed at Execute() with PostgreSQL's
+            // FIRST statement in a transaction, so this handler can only come before everything else in its
+            // batch. Enlisted after anything else it failed at Execute() with PostgreSQL's
             // `25001: SET TRANSACTION ISOLATION LEVEL must be called before any query`, which names an
             // isolation level the caller never mentioned and says nothing about ordering. Nothing about
             // CreateBatchQuery() suggests one of its members has to go first, so refuse it where the
             // ordering is actually decided.
-            if (_items.Count > 0)
+            //
+            // Others like it may come first too: Execute() then writes one bracket around all of them, which
+            // gives them one snapshot as well. Two brackets in one batch was the same 25001.
+            var others = _items.Count - _leadingSelfTransacting.Count;
+            if (others > 0)
             {
                 throw new InvalidOperationException(
-                    $"A batched {describeSelfTransactingHandler(selfTransacting)} has to be the FIRST operation in its "
-                    + $"batch, but {_items.Count} operation(s) are already enlisted. It wraps its reads in "
-                    + "'begin transaction isolation level repeatable read read only' … 'end' so they share one "
-                    + "snapshot, and PostgreSQL only accepts that as the first statement in a transaction. "
-                    + "Enlist it first, or give it its own batch.");
+                    $"A batched {describeSelfTransactingHandler(selfTransacting)} has to come before every other kind "
+                    + $"of operation in its batch, but {others} other operation(s) are already enlisted. It wraps its "
+                    + "reads in 'begin transaction isolation level repeatable read read only' … 'end' so they share "
+                    + "one snapshot, and PostgreSQL only accepts that as the first statement in a transaction. Fetches "
+                    + "like it can share that bracket, so enlist all of them first, or give it its own batch.");
             }
+
+            _leadingSelfTransacting.Add(selfTransacting);
         }
 
         var item = new BatchQueryItem<T>(handler);

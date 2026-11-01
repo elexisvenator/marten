@@ -4,7 +4,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using JasperFx.Events;
-using JasperFx.Events.Projections;
+using Marten.Exceptions;
 
 namespace Marten.Events;
 
@@ -56,23 +56,9 @@ internal partial class EventStore
             return Array.Empty<IEventStream<T>>();
         }
 
-        // An Async-projected aggregate cannot be batched more than once. Its fetch brackets its reads
-        // in `begin transaction isolation level repeatable read read only` so they share one snapshot,
-        // and PostgreSQL only accepts that as the FIRST statement in a transaction -- so the second
-        // one in a batch is refused outright. Falling back to the sequential shape keeps this working
-        // for that lifecycle, which is what the JasperFx default did and what callers already rely on;
-        // refusing instead would make the faster path a regression for anyone using Async snapshots.
-        if (FindFetchPlan<T, TId>().Lifecycle == ProjectionLifecycle.Async)
-        {
-            var sequential = new IEventStream<T>[identities.Count];
-            for (var i = 0; i < identities.Count; i++)
-            {
-                sequential[i] = await fetchOne(identities[i]).ConfigureAwait(false);
-            }
-
-            return sequential;
-        }
-
+        // An Async-projected aggregate's fetch brackets its reads in `begin transaction isolation level
+        // repeatable read read only` … `end`. Every item here is that fetch, all at the start of the batch, so
+        // the batch writes one bracket around the lot: one round trip, and one snapshot for every stream.
         var batch = _session.CreateBatchQuery();
 
         // Enlisting is synchronous and hands back an unawaited Task per stream; nothing is executed
@@ -83,12 +69,24 @@ internal partial class EventStore
             pending[i] = enlist(batch, identities[i]);
         }
 
-        await batch.Execute(cancellation).ConfigureAwait(false);
-
         var streams = new IEventStream<T>[identities.Count];
-        for (var i = 0; i < identities.Count; i++)
+        try
         {
-            streams[i] = await pending[i].ConfigureAwait(false);
+            await batch.Execute(cancellation).ConfigureAwait(false);
+
+            for (var i = 0; i < identities.Count; i++)
+            {
+                streams[i] = await pending[i].ConfigureAwait(false);
+            }
+        }
+        catch (SnapshotRaceException)
+        {
+            // Only possible without the bracket, on a session already holding a transaction (#5611). A batched
+            // fetch cannot redo itself, but FetchForWriting can, so fall back to one at a time (#5613).
+            for (var i = 0; i < identities.Count; i++)
+            {
+                streams[i] = await fetchOne(identities[i]).ConfigureAwait(false);
+            }
         }
 
         return streams;
