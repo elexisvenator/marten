@@ -453,6 +453,8 @@ The JasperFx source generator reports natural key mistakes as compiler errors, a
 | `JFXEVT011` | A mapped key's source is not an aggregate projection, or owns no natural key |
 | `JFXEVT012` | A mapped key's source key is itself mapped |
 | `JFXEVT013` | A mapped key's type does not match the type of the key its source owns |
+| `JFXEVT014` | Wolverine's `[WriteAggregate<TKey>]`, `[ReadAggregate<TKey>]`, `[WriteModel<TKey>]` or `[ReadModel<TKey>]` (or `NaturalKey = typeof(TKey)`) names a key type the aggregate doesn't have |
+| `JFXEVT015` | One of those attributes names `TKey?` instead of `TKey` |
 
 ::: warning Breaking changes
 These were accepted silently before, and now fail:
