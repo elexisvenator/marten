@@ -10,6 +10,8 @@ using Xunit;
 
 namespace EventSourcingTests.FetchForWriting;
 
+#region sample_nullable_natural_key_aggregate
+
 public readonly record struct Sku(string Value);
 
 public record ProductListed(Sku Sku, string Name);
@@ -45,6 +47,8 @@ public class Product
 
     public void Apply(ProductRestocked e) => Stock += e.Quantity;
 }
+
+#endregion
 
 // An async view mapped to the owner's key, declared non-nullable where the owner's is nullable
 public class ProductStock

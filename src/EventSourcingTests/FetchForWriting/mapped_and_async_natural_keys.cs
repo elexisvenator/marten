@@ -130,8 +130,13 @@ public class mapped_and_async_natural_keys: OneOffConfigurationsContext
     {
         StoreOptions(opts =>
         {
+            #region sample_registering_mapped_natural_key_projections
+            // The owner maintains the order number lookup inline...
             opts.Projections.Snapshot<OrderAggregate>(SnapshotLifecycle.Inline);
+
+            // ...and the async view is fetched through it
             opts.Projections.Snapshot<OrderSummary>(SnapshotLifecycle.Async);
+            #endregion
         });
 
         var orderNumber = new OrderNumber("MAPPED-1");
@@ -142,7 +147,11 @@ public class mapped_and_async_natural_keys: OneOffConfigurationsContext
             new OrderItemAdded("Gadget", 19.99m));
         await theSession.SaveChangesAsync();
 
+        #region sample_fetch_async_aggregate_by_mapped_natural_key
+        // Current state, whether or not the daemon has caught up yet
         var latest = await theSession.Events.FetchLatest<OrderSummary, OrderNumber>(orderNumber);
+        #endregion
+
         latest.ShouldNotBeNull();
         latest.Id.ShouldBe(streamId);
         latest.Items.ShouldBe(2);

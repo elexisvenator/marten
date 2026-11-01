@@ -47,6 +47,7 @@ public class batch_querying_by_natural_key: OneOffConfigurationsContext
         await using var session = theStore.LightweightSession();
         var before = session.RequestCount;
 
+        #region sample_batch_fetch_by_natural_key
         var batch = session.CreateBatchQuery();
 
         // The async fetch brackets its reads in its own transaction, so it has to come first
@@ -56,7 +57,9 @@ public class batch_querying_by_natural_key: OneOffConfigurationsContext
         var invoiceAggregate = batch.Events.FetchLatest<InvoiceAggregate, InvoiceNumber>(invoice);
         var missing = batch.Events.FetchLatest<InvoiceAggregate, InvoiceNumber>(new InvoiceNumber("INV-NONE"));
 
+        // One round trip for all five
         await batch.Execute();
+        #endregion
 
         session.RequestCount.ShouldBe(before + 1);
 
