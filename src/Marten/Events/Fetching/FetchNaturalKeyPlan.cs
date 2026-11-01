@@ -386,9 +386,12 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
     public async ValueTask<TDoc?> ProjectLatest(DocumentSessionBase session, TNaturalKey id,
         CancellationToken cancellation)
     {
-        // A stream started in this session has no lookup row until SaveChanges runs the projection that
-        // writes it, so it cannot be found here. A committed stream can, and this session's pending events
-        // for it are folded in.
+        // Accepted behaviour: the key is resolved against the committed lookup, not this session's pending
+        // events. A stream started in this session has no lookup row until SaveChanges runs the projection
+        // that writes it, so it cannot be found here. A committed stream can, and this session's pending
+        // events for it are folded in, even when they change the key: the old key still finds the stream,
+        // and returns the aggregate under its new key, while the new key finds nothing until the commit.
+        // Not exposed publicly: there is no ProjectLatest<T, TId> on IEventStoreOperations.
         var (found, streamId, _, aggregate) = await fetchForReading(session, id, cancellation).ConfigureAwait(false);
         if (!found) return default;
 
