@@ -1385,6 +1385,15 @@ public partial class EventGraph: EventRegistry, IEventStoreOptions, IReadOnlyEve
 
     public List<Type> GlobalAggregates { get; } = new();
 
+    private NaturalKeyStreamIndex? _naturalKeyStreams;
+
+    /// <summary>
+    /// Natural key pointers into the aggregate write cache, so a fetch by natural key can use it too.
+    /// </summary>
+    internal NaturalKeyStreamIndex NaturalKeyStreams =>
+        LazyInitializer.EnsureInitialized(ref _naturalKeyStreams,
+            () => new NaturalKeyStreamIndex(this, AggregateWriteCaching.SizeLimit));
+
     /// <summary>
     ///     Keep recently fetched snapshots of <typeparamref name="T" /> in a node local cache so that a
     ///     subsequent FetchForWriting can skip loading the stored snapshot and read only the events after

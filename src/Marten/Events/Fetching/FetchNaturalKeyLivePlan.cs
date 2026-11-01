@@ -62,10 +62,34 @@ internal class FetchNaturalKeyLivePlan<TDoc, TNaturalKey, TId>: FetchNaturalKeyP
         await identityStrategy(session).EnsureEventStorageExists<TDoc>(session, cancellation).ConfigureAwait(false);
     }
 
+    // Live aggregates are never cached, so cached is always null here
     protected override void writeAggregateStatements(ICommandBuilder builder, QuerySession session,
-        object keyValue)
+        object keyValue, CachedSnapshot? cached)
     {
+        builder.StartNewCommand();
         eventQuery(session, keyValue).ConfigureCommand(builder, session);
+    }
+
+    // As FetchLivePlan.FetchForReading: a stream fetched for writing earlier in the session, plus whatever has
+    // been appended to it since
+    protected override async ValueTask<(bool found, TDoc? aggregate)> tryFetchFromIdentityMapAsync(
+        DocumentSessionBase session, object keyValue, CancellationToken cancellation)
+    {
+        if (session.ItemMap.TryGetValue(typeof(IEventStream<TDoc>), out var raw) &&
+            raw is Dictionary<TId, IEventStream<TDoc>> streams)
+        {
+            foreach (var (streamId, stream) in streams)
+            {
+                if (!currentKeyMatches(stream, keyValue)) continue;
+
+                var aggregate = await _aggregator
+                    .BuildAsync(stream.Events, session, stream.Aggregate, streamId, _identitySetter, cancellation)
+                    .ConfigureAwait(false);
+                return (true, aggregate);
+            }
+        }
+
+        return (false, null);
     }
 
     private ListQueryHandler<IEvent> eventQuery(QuerySession session, object keyValue)
@@ -81,8 +105,10 @@ internal class FetchNaturalKeyLivePlan<TDoc, TNaturalKey, TId>: FetchNaturalKeyP
     }
 
     protected override async Task<TDoc?> readAggregateAsync(DbDataReader reader, DocumentSessionBase session,
-        bool found, TId streamId, long version, bool detectSnapshotRace, CancellationToken cancellation)
+        bool found, TId streamId, long version, bool detectSnapshotRace, CachedSnapshot? cached,
+        CancellationToken cancellation)
     {
+        await reader.NextResultAsync(cancellation).ConfigureAwait(false);
         var events = await new ListQueryHandler<IEvent>(null, session.EventStorage())
             .HandleAsync(reader, session, cancellation).ConfigureAwait(false);
 

@@ -7,6 +7,7 @@ using JasperFx.Core;
 using JasperFx.Core.Reflection;
 using JasperFx.Events;
 using JasperFx.Events.Aggregation;
+using JasperFx.Events.Fetching;
 using JasperFx.Events.Projections;
 using Marten.Exceptions;
 using Marten.Services;
@@ -58,6 +59,45 @@ internal class FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TId>: FetchNaturalKey
 
     protected override bool SharesOneSnapshot => true;
 
+    protected override bool UsesWriteCache => true;
+
+    // As FetchAsyncPlan: a snapshot behind the stream is caught up by the delta, one ahead of it is wrong
+    protected override bool cachedSnapshotFits(long cachedVersion, long streamVersion) =>
+        cachedVersion <= streamVersion;
+
+    // As FetchAsyncPlan: the aggregate is now at the stream version, which is durable whatever the caller does
+    // next, because events it appends are not applied to this instance under the Async lifecycle
+    protected override void offerToCache(DocumentSessionBase session, IAggregateWriteCache cache,
+        AggregateCacheKey key, TDoc aggregate, TId streamId, long version)
+    {
+        if (version <= 0) return;
+
+        cache.Store(key, aggregate, version);
+        _events.NaturalKeyStreams.Register(key, aggregate);
+    }
+
+    // As FetchAsyncPlan.FetchForReading: a stream fetched for writing earlier in the session, plus whatever has
+    // been appended to it since
+    protected override async ValueTask<(bool found, TDoc? aggregate)> tryFetchFromIdentityMapAsync(
+        DocumentSessionBase session, object keyValue, CancellationToken cancellation)
+    {
+        if (session.ItemMap.TryGetValue(typeof(IEventStream<TDoc>), out var raw) &&
+            raw is Dictionary<TId, IEventStream<TDoc>> streams)
+        {
+            foreach (var (streamId, stream) in streams)
+            {
+                if (!currentKeyMatches(stream, keyValue)) continue;
+
+                var aggregate = await _aggregator
+                    .BuildAsync(stream.Events, session, stream.Aggregate, streamId, _storage, cancellation)
+                    .ConfigureAwait(false);
+                return (true, aggregate);
+            }
+        }
+
+        return (false, null);
+    }
+
     protected override async Task prepareAsync(DocumentSessionBase session, CancellationToken cancellation)
     {
         await base.prepareAsync(session, cancellation).ConfigureAwait(false);
@@ -74,18 +114,33 @@ internal class FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TId>: FetchNaturalKey
         => FetchAsyncPlan<TDoc, TId>.forgetSnapshot(session, streamId);
 
     protected override void writeAggregateStatements(ICommandBuilder builder, QuerySession session,
-        object keyValue)
+        object keyValue, CachedSnapshot? cached)
     {
         // A batch enlists without going through prepareAsync
         ensureInitialSql(session.EventStorage());
 
-        writeDocumentLoad(builder, _storage, session, keyValue);
+        if (cached == null)
+        {
+            builder.StartNewCommand();
+            writeDocumentLoad(builder, _storage, session, keyValue);
+        }
 
         builder.StartNewCommand();
 
         builder.Append(_initialSql!);
-        builder.Append(_deltaJoinSql);
-        _lookup.WriteStreamIdSubselect(builder, keyValue);
+        if (cached == null)
+        {
+            builder.Append(_deltaJoinSql);
+            _lookup.WriteStreamIdSubselect(builder, keyValue);
+        }
+        else
+        {
+            // The baseline version is known, so the delta needs no join to the aggregate table
+            builder.Append(" where d.stream_id = ");
+            _lookup.WriteStreamIdSubselect(builder, keyValue);
+            builder.Append(" and d.version > ");
+            builder.AppendParameter(cached.Version);
+        }
 
         // You must do this for performance even if the stream ids were magically unique across tenants
         if (_events.TenancyStyle == TenancyStyle.Conjoined && !IsGlobal)
@@ -98,9 +153,19 @@ internal class FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TId>: FetchNaturalKey
     }
 
     protected override async Task<TDoc?> readAggregateAsync(DbDataReader reader, DocumentSessionBase session,
-        bool found, TId streamId, long version, bool detectSnapshotRace, CancellationToken cancellation)
+        bool found, TId streamId, long version, bool detectSnapshotRace, CachedSnapshot? cached,
+        CancellationToken cancellation)
     {
-        TDoc? document = await readDocumentAsync(reader, _storage, session, cancellation).ConfigureAwait(false);
+        TDoc? document;
+        if (cached != null)
+        {
+            document = cached.Aggregate;
+        }
+        else
+        {
+            await reader.NextResultAsync(cancellation).ConfigureAwait(false);
+            document = await readDocumentAsync(reader, _storage, session, cancellation).ConfigureAwait(false);
+        }
 
         await reader.NextResultAsync(cancellation).ConfigureAwait(false);
         var events = await new ListQueryHandler<IEvent>(null, session.EventStorage())

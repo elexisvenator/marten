@@ -328,6 +328,7 @@ internal partial class FetchAsyncPlan<TDoc, TId>
             if (cacheAttempt.Cache != null && document != null && version > 0)
             {
                 cacheAttempt.Cache.Store(cacheAttempt.Key, document, version);
+                _events.NaturalKeyStreams.Register(cacheAttempt.Key, document);
             }
 
             var stream = version == 0

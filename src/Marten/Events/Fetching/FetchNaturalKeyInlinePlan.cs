@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using JasperFx.Core.Reflection;
 using JasperFx.Events;
 using JasperFx.Events.Aggregation;
+using JasperFx.Events.Fetching;
 using JasperFx.Events.Projections;
 using Marten.Internal;
 using Marten.Internal.Sessions;
@@ -37,6 +38,44 @@ internal class FetchNaturalKeyInlinePlan<TDoc, TNaturalKey, TId>: FetchNaturalKe
     // FetchInlinedPlan, rather than the stream.
     protected override bool RemembersStreamInIdentityMap => false;
 
+    protected override bool UsesWriteCache => true;
+
+    // An Inline snapshot is always exactly at the stream head, so a cached one has to be too
+    protected override bool cachedSnapshotFits(long cachedVersion, long streamVersion) =>
+        cachedVersion == streamVersion;
+
+    // As FetchInlinedPlan: the commit mutates this instance, so it is written back only after the commit
+    protected override void offerToCache(DocumentSessionBase session, IAggregateWriteCache cache,
+        AggregateCacheKey key, TDoc aggregate, TId streamId, long version)
+    {
+        PendingAggregateCacheWrites.TrackForWriteBack(session, cache, key, aggregate, streamId, version);
+    }
+
+    protected override ValueTask<(bool found, TDoc? aggregate)> tryFetchFromIdentityMapAsync(
+        DocumentSessionBase session, object keyValue, CancellationToken cancellation)
+    {
+        return new(tryFindInIdentityMap(session, keyValue, out var aggregate) ? (true, aggregate) : (false, null));
+    }
+
+    protected override bool tryFindInIdentityMap(DocumentSessionBase session, object keyValue,
+        out TDoc? aggregate)
+    {
+        if (session.ItemMap.TryGetValue(typeof(TDoc), out var raw) && raw is Dictionary<TId, TDoc> map)
+        {
+            foreach (var candidate in map.Values)
+            {
+                if (hasKey(candidate, keyValue))
+                {
+                    aggregate = candidate;
+                    return true;
+                }
+            }
+        }
+
+        aggregate = null;
+        return false;
+    }
+
     /// <summary>
     /// The same choice of storage as <see cref="FetchInlinedPlan{TDoc,TId}"/>.
     /// </summary>
@@ -55,14 +94,32 @@ internal class FetchNaturalKeyInlinePlan<TDoc, TNaturalKey, TId>: FetchNaturalKe
     }
 
     protected override void writeAggregateStatements(ICommandBuilder builder, QuerySession session,
-        object keyValue)
+        object keyValue, CachedSnapshot? cached)
     {
+        // A cached snapshot is the whole aggregate: the snapshot load is exactly what the cache removes
+        if (cached != null) return;
+
+        builder.StartNewCommand();
         writeDocumentLoad(builder, findDocumentStorage(session), session, keyValue);
     }
 
     protected override async Task<TDoc?> readAggregateAsync(DbDataReader reader, DocumentSessionBase session,
-        bool found, TId streamId, long version, bool detectSnapshotRace, CancellationToken cancellation)
+        bool found, TId streamId, long version, bool detectSnapshotRace, CachedSnapshot? cached,
+        CancellationToken cancellation)
     {
+        if (cached != null)
+        {
+            // As FetchInlinedPlan on a cache hit: the identity map is what lets the inline projection reuse
+            // this instance during commit
+            if (((IMartenSession)session).Options.Events.UseIdentityMapForAggregates)
+            {
+                session.StoreDocumentInItemMap(streamId, cached.Aggregate);
+            }
+
+            return cached.Aggregate;
+        }
+
+        await reader.NextResultAsync(cancellation).ConfigureAwait(false);
         return await readDocumentAsync(reader, findDocumentStorage(session), session, cancellation)
             .ConfigureAwait(false);
     }

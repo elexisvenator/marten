@@ -418,7 +418,7 @@ When writing integration tests:
 
 - The lookup row for a key is written when the session's changes are saved. A stream started in the current, uncommitted session cannot be found by its natural key yet. Once it is committed, `FetchLatest` and `FetchForWriting` by natural key include the session's pending events for it, as a fetch by stream id does
 - `FetchForWriting` with a natural key that does not exist starts a new stream, as it does for a stream id that does not exist. The key is claimed when an event that sets it is appended
-- Natural key fetches do not yet use the identity map or aggregate write caching short cuts that fetches by stream id do
+- Natural key fetches use the identity map and aggregate write caching like fetches by stream id do. With `UseIdentityMapForAggregates`, `FetchLatest` by natural key is answered from the session when it already holds the aggregate, matched by its current key. With write caching enabled, `FetchForWriting` by natural key takes the cached snapshot, while the key itself is still resolved in the database in the same round trip
 
 ## Build-Time Diagnostics
 

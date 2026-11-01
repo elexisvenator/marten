@@ -41,6 +41,23 @@ internal sealed class PendingAggregateCacheWrites
         _entries.Add(new Entry(cache, key, aggregate, streamId, fetchedVersion));
     }
 
+    /// <summary>
+    /// Queues <paramref name="aggregate" /> to be written back to <paramref name="cache" /> once the session
+    /// commits, creating the session's pending list on first use.
+    /// </summary>
+    public static void TrackForWriteBack(IMartenSession session, IAggregateWriteCache cache, AggregateCacheKey key,
+        object aggregate, object streamId, long fetchedVersion)
+    {
+        if (!session.ItemMap.TryGetValue(typeof(PendingAggregateCacheWrites), out var raw) ||
+            raw is not PendingAggregateCacheWrites pending)
+        {
+            pending = new PendingAggregateCacheWrites();
+            session.ItemMap[typeof(PendingAggregateCacheWrites)] = pending;
+        }
+
+        pending.Track(cache, key, aggregate, streamId, fetchedVersion);
+    }
+
     internal sealed record Entry(
         IAggregateWriteCache Cache,
         AggregateCacheKey Key,
@@ -85,6 +102,9 @@ internal sealed class AggregateWriteCacheListener: DocumentSessionListenerBase
             if (version > 0)
             {
                 entry.Cache.Store(entry.Key, entry.Aggregate, version);
+
+                // Whichever way it was fetched, the aggregate can now be found by its natural keys too
+                martenSession.Options.EventGraph.NaturalKeyStreams.Register(entry.Key, entry.Aggregate);
             }
         }
 
