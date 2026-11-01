@@ -118,9 +118,13 @@ An aggregate can own at most one natural key. It can also borrow keys owned by o
 ### Nullable Keys
 
 A natural key whose type is a struct may be declared nullable: on the aggregate, on an event, or as the return
-type of a `[NaturalKeySource]` method. `TKey` and `TKey?` are the same key wherever either appears. The key is
-fetched with `FetchLatest<T, TKey>`, a source returning `TKey` binds to a `TKey?` property and the other way
-round, and a mapped key may be declared nullable where the owner's is not.
+type of a `[NaturalKeySource]` method. `TKey` and `TKey?` are the same key wherever either is declared: a
+source returning `TKey` binds to a `TKey?` property and the other way round, and a mapped key may be declared
+nullable where the owner's is not.
+
+The fetch APIs take `TKey` only. `FetchForWriting<T, TKey?>`, `FetchLatest<T, TKey?>` and the batch forms throw
+an `ArgumentException`. A null key can't match a stream, and you know when you have one, so check for null and
+fetch by its value.
 
 <!-- snippet: sample_nullable_natural_key_aggregate -->
 <a id='snippet-sample_nullable_natural_key_aggregate'></a>

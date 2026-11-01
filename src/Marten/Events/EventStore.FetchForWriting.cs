@@ -304,6 +304,15 @@ internal partial class EventStore: IEventIdentityStrategy<Guid>, IEventIdentityS
 
     private IAggregateFetchPlan<TDoc, TId> determineFetchPlan<TDoc, TId>(StoreOptions options) where TDoc : class where TId : notnull
     {
+        // Every fetch API comes through here, session and batch alike. A null key can never match a
+        // stream, and the caller already knows when it has one, so TKey? is refused rather than quietly
+        // treated as TKey. The notnull constraint only warns for Nullable<T>.
+        if (Nullable.GetUnderlyingType(typeof(TId)) is { } underlying)
+        {
+            throw new ArgumentException(
+                $"{typeof(TDoc).FullNameInCode()} cannot be fetched by {typeof(TId).FullNameInCode()}. Fetch by {underlying.FullNameInCode()} instead, and handle a null value before fetching.");
+        }
+
         // For natural key types, try natural key planners first before attempting the cast to
         // IEventIdentityStrategy<TId>. #5344: a natural key is usually a wrapper (neither Guid nor
         // string), but it can also be a primitive `string` on a Guid-identity store — in which case
@@ -402,8 +411,9 @@ internal partial class EventStore: IEventIdentityStrategy<Guid>, IEventIdentityS
             return NaturalKeyFetchPlanner.FindNaturalKey(projection, typeof(TId)) != null;
         }
 
+        // The aggregate may declare its key as TKey?, which is the TKey key
         return FindNaturalKeyProperty<TDoc>() is { } property &&
-               NaturalKeyDefinition.KeyTypeOf(property.PropertyType) == NaturalKeyDefinition.KeyTypeOf(typeof(TId));
+               NaturalKeyDefinition.KeyTypeOf(property.PropertyType) == typeof(TId);
     }
 
     [UnconditionalSuppressMessage("Trimming", "IL2072",
@@ -430,9 +440,9 @@ internal partial class EventStore: IEventIdentityStrategy<Guid>, IEventIdentityS
 
         var naturalKeyProp = FindNaturalKeyProperty<TDoc>();
 
-        // TKey and TKey? are the same key
+        // A TKey? property is the TKey key
         if (naturalKeyProp == null ||
-            NaturalKeyDefinition.KeyTypeOf(naturalKeyProp.PropertyType) != NaturalKeyDefinition.KeyTypeOf(typeof(TId)))
+            NaturalKeyDefinition.KeyTypeOf(naturalKeyProp.PropertyType) != typeof(TId))
         {
             return false;
         }

@@ -107,7 +107,7 @@ public class nullable_natural_keys: OneOffConfigurationsContext
     }
 
     [Fact]
-    public async Task a_nullable_struct_key_can_be_asked_for_by_its_nullable_type()
+    public async Task fetching_by_the_nullable_key_type_is_refused()
     {
         StoreOptions(opts => opts.Projections.Snapshot<Product>(SnapshotLifecycle.Inline));
 
@@ -115,9 +115,24 @@ public class nullable_natural_keys: OneOffConfigurationsContext
         theSession.Events.StartStream<Product>(Guid.NewGuid(), new ProductListed(sku, "Gadget"));
         await theSession.SaveChangesAsync();
 
+        // The caller knows whether it has a key, so it handles null itself and fetches by Sku
         Sku? asNullable = sku;
-        (await theSession.Events.FetchLatest<Product, Sku?>(asNullable))!.Name.ShouldBe("Gadget");
-        (await theSession.Events.FetchForWriting<Product, Sku?>(asNullable)).CurrentVersion.ShouldBe(1);
+
+        var ex = await Should.ThrowAsync<ArgumentException>(async () =>
+            await theSession.Events.FetchLatest<Product, Sku?>(asNullable));
+        ex.Message.ShouldContain("Fetch by");
+
+        await Should.ThrowAsync<ArgumentException>(() =>
+            theSession.Events.FetchForWriting<Product, Sku?>(asNullable));
+        await Should.ThrowAsync<ArgumentException>(() =>
+            theSession.Events.FetchForWriting<Product, Sku?>(asNullable, 1));
+        await Should.ThrowAsync<ArgumentException>(() =>
+            theSession.Events.FetchForExclusiveWriting<Product, Sku?>(asNullable));
+        await Should.ThrowAsync<ArgumentException>(async () =>
+            await theSession.Events.FetchLatest<Ticket, int?>(1042));
+
+        var batch = theSession.CreateBatchQuery();
+        Should.Throw<ArgumentException>(() => batch.Events.FetchForWriting<Product, Sku?>(asNullable));
     }
 
     [Fact]
@@ -262,7 +277,5 @@ public class nullable_natural_keys: OneOffConfigurationsContext
         latest.ShouldNotBeNull();
         latest.Id.ShouldBe(streamId);
         latest.Notes.ShouldBe(1);
-
-        (await theSession.Events.FetchLatest<Ticket, int?>(1042))!.Id.ShouldBe(streamId);
     }
 }
