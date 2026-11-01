@@ -14,6 +14,11 @@ Use natural keys when:
 
 Mark a property on your aggregate with `[NaturalKey]`, and mark the methods that set or change the key value with `[NaturalKeySource]`:
 
+- The key type is an `int`, `long` or `string`, or a strong-typed identifier wrapping one of those in a single
+  `Value` property. Any other type is refused when the store is built.
+- Every owned key needs at least one event that sets it, through `[NaturalKeySource]` or `NaturalKeyFor()`.
+  A key no event sets is refused too, because its lookup would never be written.
+
 <!-- snippet: sample_natural_key_aggregate_types -->
 <a id='snippet-sample_natural_key_aggregate_types'></a>
 ```cs
@@ -465,6 +470,14 @@ These were accepted silently before, and now fail:
 - Two `[NaturalKeySource]` methods for the same event that derive the key differently. Which one won
   depended on reflection order.
 - `[NaturalKeySource]` methods on an aggregate that only has mapped keys, which were never used.
+- An owned `[NaturalKey]` that no event sets: no `[NaturalKeySource]` and no `NaturalKeyFor()` registration.
+  Its lookup was never written, so fetching by it always found nothing. A mapped key needs neither, because its
+  source projection maintains the lookup. An aggregate auto-registered on its first fetch fails at that fetch.
+- A key type other than `int`, `long` or `string`, or a strong-typed identifier wrapping one of those: a
+  `Guid`, a wrapper around a `Guid`, or a record with more than one member. These used to fail on the first
+  append, with a cast error or a SQL error from writing the lookup row.
+- Fetching by `TKey?` (`FetchForWriting<T, TKey?>`, `FetchLatest<T, TKey?>` and the batch forms). Fetch by
+  `TKey`, after checking for null.
 
 A source returning `null` for a stream that already has a key now retires the key. Before, the stream stayed
 reachable by its old key.
