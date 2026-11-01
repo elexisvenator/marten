@@ -15,7 +15,9 @@ Use natural keys when:
 Mark a property on your aggregate with `[NaturalKey]`, and mark the methods that set or change the key value with `[NaturalKeySource]`:
 
 - The key type is an `int`, `long` or `string`, or a strong-typed identifier wrapping one of those in a single
-  `Value` property. Any other type is refused when the store is built.
+  `Value` property. Any other type is refused when the store is built. Prefer the strong-typed identifier.
+- On a store with `StreamIdentity.AsString`, a bare `string` key is refused too: a fetch by `string` there is a
+  fetch by stream key. Wrap the key.
 - Every owned key needs at least one event that sets it, through `[NaturalKeySource]` or `NaturalKeyFor()`.
   A key no event sets is refused too, because its lookup would never be written.
 
@@ -499,6 +501,8 @@ These were accepted silently before, and now fail:
   append, with a cast error or a SQL error from writing the lookup row.
 - Fetching by `TKey?` (`FetchForWriting<T, TKey?>`, `FetchLatest<T, TKey?>` and the batch forms). Fetch by
   `TKey`, after checking for null.
+- A bare `string` key on a store with `StreamIdentity.AsString`. Fetching by it fetched by stream key instead,
+  finding nothing or starting a new stream named after the key.
 
 A source returning `null` for a stream that already has a key now retires the key. Before, the stream stayed
 reachable by its old key.
