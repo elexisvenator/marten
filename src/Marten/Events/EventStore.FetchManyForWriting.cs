@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using JasperFx.Events;
+using JasperFx.Events.Projections;
 using Marten.Exceptions;
 
 namespace Marten.Events;
@@ -45,7 +46,7 @@ internal partial class EventStore
     /// <summary>
     ///     The many-stream form of <see cref="FetchForWriting{T, TId}(TId, CancellationToken)" />: by a natural
     ///     key, a strong-typed identifier or the stream id itself, in one round trip. A natural key is resolved
-    ///     inside the batch, and an Async aggregate's fetches share one snapshot.
+    ///     inside the batch.
     /// </summary>
     /// <remarks>
     ///     An id that matches no stream comes back as a handle with a null aggregate at version 0, as a single
@@ -96,9 +97,6 @@ internal partial class EventStore
             return Array.Empty<IEventStream<T>>();
         }
 
-        // An Async-projected aggregate's fetch brackets its reads in `begin transaction isolation level
-        // repeatable read read only` … `end`. Every item here is that fetch, all at the start of the batch, so
-        // the batch writes one bracket around the lot: one round trip, and one snapshot for every stream.
         var batch = _session.CreateBatchQuery();
 
         // Enlisting is synchronous and hands back an unawaited Task per stream; nothing is executed
@@ -109,24 +107,28 @@ internal partial class EventStore
             pending[i] = enlist(batch, identities[i]);
         }
 
-        var streams = new IEventStream<T>[identities.Count];
         try
         {
             await batch.Execute(cancellation).ConfigureAwait(false);
-
-            for (var i = 0; i < identities.Count; i++)
-            {
-                streams[i] = await pending[i].ConfigureAwait(false);
-            }
         }
         catch (SnapshotRaceException)
         {
-            // Only possible without the bracket, on a session already holding a transaction (#5611). A batched
-            // fetch cannot redo itself, but FetchForWriting can, so fall back to one at a time (#5613).
+            // An Async snapshot went backwards mid-batch, as it does while a projection is rebuilt. A batch
+            // cannot redo one fetch, but the single-stream fetch can, so fall back to one per stream.
+            // Nothing was handed out yet, so the abandoned batch items are never observed.
+            var sequential = new IEventStream<T>[identities.Count];
             for (var i = 0; i < identities.Count; i++)
             {
-                streams[i] = await fetchOne(identities[i]).ConfigureAwait(false);
+                sequential[i] = await fetchOne(identities[i]).ConfigureAwait(false);
             }
+
+            return sequential;
+        }
+
+        var streams = new IEventStream<T>[identities.Count];
+        for (var i = 0; i < identities.Count; i++)
+        {
+            streams[i] = await pending[i].ConfigureAwait(false);
         }
 
         return streams;

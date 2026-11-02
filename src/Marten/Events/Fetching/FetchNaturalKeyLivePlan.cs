@@ -104,7 +104,7 @@ internal class FetchNaturalKeyLivePlan<TDoc, TNaturalKey, TId>: FetchNaturalKeyP
         return new ListQueryHandler<IEvent>(statement, selector);
     }
 
-    protected override async Task<TDoc?> readAggregateAsync(DbDataReader reader, DocumentSessionBase session,
+    protected override async Task<(TDoc? aggregate, long version)> readAggregateAsync(DbDataReader reader, DocumentSessionBase session,
         bool found, TId streamId, long version, bool detectSnapshotRace, CachedSnapshot? cached,
         CancellationToken cancellation)
     {
@@ -112,7 +112,7 @@ internal class FetchNaturalKeyLivePlan<TDoc, TNaturalKey, TId>: FetchNaturalKeyP
         var events = await new ListQueryHandler<IEvent>(null, session.EventStorage())
             .HandleAsync(reader, session, cancellation).ConfigureAwait(false);
 
-        if (!found) return default;
+        if (!found) return (default, version);
 
         _events.Options.OpenTelemetry
             .RecordEventsReplayed(events.Count, _aggregateTypeName, OpenTelemetryOptions.LivePlan);
@@ -125,7 +125,7 @@ internal class FetchNaturalKeyLivePlan<TDoc, TNaturalKey, TId>: FetchNaturalKeyP
             _identitySetter.SetIdentity(document, streamId);
         }
 
-        return document;
+        return (document, version);
     }
 
     protected override async Task<TDoc?> applyPendingEventsAsync(DocumentSessionBase session, TId streamId,

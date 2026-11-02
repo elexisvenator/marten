@@ -403,8 +403,6 @@ fetch resolves its key inside the batch, so the whole batch is still one round t
 <a id='snippet-sample_batch_fetch_by_natural_key'></a>
 ```cs
 var batch = session.CreateBatchQuery();
-
-// The async fetch brackets its reads in a transaction, so it comes before anything else
 var summary = batch.Events.FetchLatest<OrderSummary, OrderNumber>(order);
 var owner = batch.Events.FetchLatest<OrderAggregate, OrderNumber>(order);
 var byStreamId = batch.Events.FetchLatest<OrderAggregate>(orderId);
@@ -414,13 +412,8 @@ var missing = batch.Events.FetchLatest<InvoiceAggregate, InvoiceNumber>(new Invo
 // One round trip for all five
 await batch.Execute();
 ```
-<sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/batch_querying_by_natural_key.cs#L50-L62' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_batch_fetch_by_natural_key' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/batch_querying_by_natural_key.cs#L51-L62' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_batch_fetch_by_natural_key' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
-
-The ordinary batch rules apply. A fetch of an `Async` aggregate reads its snapshot and the events after it
-inside a `repeatable read` transaction, which PostgreSQL only accepts as a transaction's first statement. So
-these fetches come before anything else in the batch, where they all share one such transaction and one
-snapshot, and they cannot share a batch with `FetchForExclusiveWriting`.
 
 ## FetchManyForWriting by Natural Key
 
@@ -440,7 +433,6 @@ var streams = await session.Events.FetchManyForWriting<OrderAggregate, OrderNumb
   `FetchForWriting` would: appending starts the stream.
 - A repeated key is refused, because two handles on one stream would race each other's expected version.
 - The keys are `TKey`, never `TKey?`, and none may be null. Drop the keys you know to be missing first.
-- An `Async` aggregate's fetches share one snapshot.
 
 ## Mutability
 

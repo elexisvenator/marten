@@ -68,13 +68,6 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
     public abstract ProjectionLifecycle Lifecycle { get; }
 
     /// <summary>
-    /// Whether the reads are bracketed to share one snapshot of the database (see
-    /// <see cref="FetchAsyncPlan{TDoc,TId}"/>): only needed where the snapshot document and the events
-    /// after it are read by separate statements.
-    /// </summary>
-    protected virtual bool SharesOneSnapshot => false;
-
-    /// <summary>
     /// Whether a fetched stream is remembered in the identity map for a later FetchLatest by stream id, as
     /// the Async and Live stream plans do.
     /// </summary>
@@ -103,9 +96,10 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
     /// <summary>
     /// Reads the result sets <see cref="writeAggregateStatements"/> produced, moving to each with
     /// <c>NextResultAsync</c>. Reads all of them whether or not the key was found, so that a batch can move on
-    /// to its next item.
+    /// to its next item. Returns the aggregate and the stream version it reflects, which is past
+    /// <paramref name="version"/> when the reads after the version row saw events appended since.
     /// </summary>
-    protected abstract Task<TDoc?> readAggregateAsync(DbDataReader reader, DocumentSessionBase session, bool found,
+    protected abstract Task<(TDoc? aggregate, long version)> readAggregateAsync(DbDataReader reader, DocumentSessionBase session, bool found,
         TId streamId, long version, bool detectSnapshotRace, CachedSnapshot? cached, CancellationToken cancellation);
 
     /// <summary>
@@ -210,14 +204,23 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
     public async Task<IEventStream<TDoc>> FetchForWriting(DocumentSessionBase session, TNaturalKey id,
         bool forUpdate, CancellationToken cancellation = default)
     {
-        // Only the Async plan detects the snapshot race. See FetchAsyncPlan.SnapshotRaceRedos for why two
-        // redos, and why the last attempt runs with detection off.
+        return await withSnapshotRaceRedos(session,
+            detect => fetchForWritingWithCache(session, id, forUpdate, detect, cancellation)).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Runs <paramref name="fetch"/> with snapshot race detection on, redoing it after a
+    /// <see cref="SnapshotRaceException"/>, and once more with detection off when the redos run out. Only the
+    /// Async plan detects the race. See FetchAsyncPlan.SnapshotRaceRedos for why two redos, and why the last
+    /// attempt runs with detection off.
+    /// </summary>
+    private async Task<T> withSnapshotRaceRedos<T>(DocumentSessionBase session, Func<bool, Task<T>> fetch)
+    {
         for (var attempt = 0; attempt < 2; attempt++)
         {
             try
             {
-                return await fetchForWritingWithCache(session, id, forUpdate, true, cancellation)
-                    .ConfigureAwait(false);
+                return await fetch(true).ConfigureAwait(false);
             }
             catch (SnapshotRaceException e)
             {
@@ -225,7 +228,7 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
             }
         }
 
-        return await fetchForWritingWithCache(session, id, forUpdate, false, cancellation).ConfigureAwait(false);
+        return await fetch(false).ConfigureAwait(false);
     }
 
     public async Task<IEventStream<TDoc>> FetchForWriting(DocumentSessionBase session, TNaturalKey id,
@@ -268,8 +271,7 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
 
         var builder = new BatchBuilder { TenantId = session.TenantId };
 
-        // The exclusive path holds a row lock in the session's own transaction, so it must not bracket.
-        writeFetch(builder, session, keyValue, forUpdate, !forUpdate && sharesOneSnapshot(session), cached);
+        writeFetch(builder, session, keyValue, forUpdate, cached);
 
         try
         {
@@ -379,7 +381,8 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
             if (inMap) return fromMap;
         }
 
-        var (found, _, _, aggregate) = await fetchForReading(session, id, cancellation).ConfigureAwait(false);
+        var (found, _, _, aggregate) = await withSnapshotRaceRedos(session,
+            detect => fetchForReading(session, id, detect, cancellation)).ConfigureAwait(false);
         return found ? aggregate : default;
     }
 
@@ -392,7 +395,8 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
         // events for it are folded in, even when they change the key: the old key still finds the stream,
         // and returns the aggregate under its new key, while the new key finds nothing until the commit.
         // Not exposed publicly: there is no ProjectLatest<T, TId> on IEventStoreOperations.
-        var (found, streamId, _, aggregate) = await fetchForReading(session, id, cancellation).ConfigureAwait(false);
+        var (found, streamId, _, aggregate) = await withSnapshotRaceRedos(session,
+            detect => fetchForReading(session, id, detect, cancellation)).ConfigureAwait(false);
         if (!found) return default;
 
         var pending = FetchPlanHelper.FindPendingEvents<TId>(session, streamId);
@@ -415,37 +419,31 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
     }
 
     private async Task<(bool found, TId streamId, long version, TDoc? aggregate)> fetchForReading(
-        DocumentSessionBase session, TNaturalKey id, CancellationToken cancellation)
+        DocumentSessionBase session, TNaturalKey id, bool detectSnapshotRace, CancellationToken cancellation)
     {
         await prepareAsync(session, cancellation).ConfigureAwait(false);
 
         var keyValue = keyValueFor(id);
         var builder = new BatchBuilder { TenantId = session.TenantId };
-        writeFetch(builder, session, keyValue, false, sharesOneSnapshot(session), null);
+        writeFetch(builder, session, keyValue, false, null);
 
         await using var reader =
             await session.ExecuteReaderAsync(builder.Compile(), cancellation).ConfigureAwait(false);
 
-        return await readFetchAsync(reader, session, keyValue, false, null, cancellation).ConfigureAwait(false);
+        return await readFetchAsync(reader, session, keyValue, detectSnapshotRace, null, cancellation)
+            .ConfigureAwait(false);
     }
 
     #endregion
 
     #region the one batched command
 
-    private bool sharesOneSnapshot(QuerySession session)
-        => SharesOneSnapshot && FetchAsyncPlan<TDoc, TId>.canShareOneSnapshot(session);
-
     private void writeFetch(ICommandBuilder builder, QuerySession session, object keyValue, bool forUpdate,
-        bool sharedSnapshot, CachedSnapshot? cached)
+        CachedSnapshot? cached)
     {
-        var opened = sharedSnapshot && FetchAsyncPlan<TDoc, TId>.beginSharedSnapshot(builder, session);
-
         _lookup.WriteVersionAndStreamId(builder, keyValue, forUpdate);
 
         writeAggregateStatements(builder, session, keyValue, cached);
-
-        FetchAsyncPlan<TDoc, TId>.endSharedSnapshot(builder, opened);
     }
 
     private async Task<(bool found, TId streamId, long version, TDoc? aggregate)> readFetchAsync(
@@ -470,10 +468,10 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
         }
 
         // A cached snapshot is never checked for a race, as on the stream-id plans: it was not read beside a delta
-        var aggregate = await readAggregateAsync(reader, session, found, streamId, version,
+        var (aggregate, reached) = await readAggregateAsync(reader, session, found, streamId, version,
             detectSnapshotRace && cached == null, cached, cancellation).ConfigureAwait(false);
 
-        return (found, streamId, version, aggregate);
+        return (found, streamId, reached, aggregate);
     }
 
     /// <summary>
@@ -517,14 +515,14 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
         long expectedStartingVersion)
     {
         session.AssertIsDocumentSession();
-        return new StreamHandler(this, id, false, expectedStartingVersion, sharesOneSnapshot(session));
+        return new StreamHandler(this, id, false, expectedStartingVersion);
     }
 
     public IQueryHandler<IEventStream<TDoc>> BuildQueryHandler(QuerySession session, TNaturalKey id,
         bool forUpdate)
     {
         session.AssertIsDocumentSession();
-        return new StreamHandler(this, id, forUpdate, null, !forUpdate && sharesOneSnapshot(session));
+        return new StreamHandler(this, id, forUpdate, null);
     }
 
     public IQueryHandler<TDoc?> BuildQueryHandler(QuerySession session, TNaturalKey id)
@@ -536,44 +534,28 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
             return new PreCannedQueryHandler<TDoc?>(inMap);
         }
 
-        return new LatestHandler(this, id, sharesOneSnapshot(session));
+        return new LatestHandler(this, id);
     }
 
-    private sealed class StreamHandler: IQueryHandler<IEventStream<TDoc>>, IOpensItsOwnTransaction
+    private sealed class StreamHandler: IQueryHandler<IEventStream<TDoc>>
     {
         private readonly FetchNaturalKeyPlan<TDoc, TNaturalKey, TId> _parent;
         private readonly TNaturalKey _id;
         private readonly bool _forUpdate;
         private readonly long? _expectedVersion;
-        private readonly bool _sharedSnapshot;
 
         public StreamHandler(FetchNaturalKeyPlan<TDoc, TNaturalKey, TId> parent, TNaturalKey id, bool forUpdate,
-            long? expectedVersion, bool sharedSnapshot)
+            long? expectedVersion)
         {
             _parent = parent;
             _id = id;
             _forUpdate = forUpdate;
             _expectedVersion = expectedVersion;
-            _sharedSnapshot = sharedSnapshot;
         }
-
-        /// <summary>
-        /// True exactly when <see cref="ConfigureCommand"/> brackets its reads, as for
-        /// <see cref="FetchAsyncPlan{TDoc,TId}.ForUpdateQueryHandler"/>.
-        /// </summary>
-        public bool OpensItsOwnTransaction => _sharedSnapshot;
-
-        public bool BracketedByBatch { get; set; }
-
-        public string CallName => "FetchForWriting";
 
         public void ConfigureCommand(ICommandBuilder builder, IStorageSession session)
         {
-            // Asked again rather than reusing _sharedSnapshot, as FetchAsyncPlan's handlers do: the session can
-            // acquire a transaction between enlistment and Execute().
-            var querySession = (QuerySession)session;
-            _parent.writeFetch(builder, querySession, _parent.keyValueFor(_id), _forUpdate,
-                !_forUpdate && !BracketedByBatch && _parent.sharesOneSnapshot(querySession), null);
+            _parent.writeFetch(builder, (QuerySession)session, _parent.keyValueFor(_id), _forUpdate, null);
         }
 
         public async Task<IEventStream<TDoc>> HandleAsync(DbDataReader reader, IStorageSession session,
@@ -606,41 +588,28 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
         }
     }
 
-    private sealed class LatestHandler: IQueryHandler<TDoc?>, IOpensItsOwnTransaction
+    private sealed class LatestHandler: IQueryHandler<TDoc?>
     {
         private readonly FetchNaturalKeyPlan<TDoc, TNaturalKey, TId> _parent;
         private readonly TNaturalKey _id;
-        private readonly bool _sharedSnapshot;
 
-        public LatestHandler(FetchNaturalKeyPlan<TDoc, TNaturalKey, TId> parent, TNaturalKey id,
-            bool sharedSnapshot)
+        public LatestHandler(FetchNaturalKeyPlan<TDoc, TNaturalKey, TId> parent, TNaturalKey id)
         {
             _parent = parent;
             _id = id;
-            _sharedSnapshot = sharedSnapshot;
         }
-
-        /// <summary>
-        /// True exactly when <see cref="ConfigureCommand"/> brackets its reads, as for
-        /// <see cref="FetchAsyncPlan{TDoc,TId}.QueryHandler"/>.
-        /// </summary>
-        public bool OpensItsOwnTransaction => _sharedSnapshot;
-
-        public bool BracketedByBatch { get; set; }
-
-        public string CallName => "FetchLatest";
 
         public void ConfigureCommand(ICommandBuilder builder, IStorageSession session)
         {
-            var querySession = (QuerySession)session;
-            _parent.writeFetch(builder, querySession, _parent.keyValueFor(_id), false,
-                !BracketedByBatch && _parent.sharesOneSnapshot(querySession), null);
+            _parent.writeFetch(builder, (QuerySession)session, _parent.keyValueFor(_id), false, null);
         }
 
         public async Task<TDoc?> HandleAsync(DbDataReader reader, IStorageSession session, CancellationToken token)
         {
+            // A batch cannot redo itself, so a snapshot race surfaces as SnapshotRaceException, as in
+            // StreamHandler
             var (found, _, _, aggregate) = await _parent
-                .readFetchAsync(reader, (DocumentSessionBase)session, _parent.keyValueFor(_id), false, null, token)
+                .readFetchAsync(reader, (DocumentSessionBase)session, _parent.keyValueFor(_id), true, null, token)
                 .ConfigureAwait(false);
 
             return found ? aggregate : default;

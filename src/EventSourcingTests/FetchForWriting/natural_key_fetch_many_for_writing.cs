@@ -77,7 +77,7 @@ public class natural_key_fetch_many_for_writing: OneOffConfigurationsContext
         await using var session = theStore.LightweightSession();
         var before = session.RequestCount;
 
-        // The async fetches share one snapshot bracket
+        // The async fetches go in one batch like any other
         var streams = await session.Events.FetchManyForWriting<OrderSummary, OrderNumber>([first, second]);
 
         session.RequestCount.ShouldBe(before + 1);

@@ -103,7 +103,7 @@ internal class FetchNaturalKeyInlinePlan<TDoc, TNaturalKey, TId>: FetchNaturalKe
         writeDocumentLoad(builder, findDocumentStorage(session), session, keyValue);
     }
 
-    protected override async Task<TDoc?> readAggregateAsync(DbDataReader reader, DocumentSessionBase session,
+    protected override async Task<(TDoc? aggregate, long version)> readAggregateAsync(DbDataReader reader, DocumentSessionBase session,
         bool found, TId streamId, long version, bool detectSnapshotRace, CachedSnapshot? cached,
         CancellationToken cancellation)
     {
@@ -116,12 +116,13 @@ internal class FetchNaturalKeyInlinePlan<TDoc, TNaturalKey, TId>: FetchNaturalKe
                 session.StoreDocumentInItemMap(streamId, cached.Aggregate);
             }
 
-            return cached.Aggregate;
+            return (cached.Aggregate, version);
         }
 
         await reader.NextResultAsync(cancellation).ConfigureAwait(false);
-        return await readDocumentAsync(reader, findDocumentStorage(session), session, cancellation)
+        var document = await readDocumentAsync(reader, findDocumentStorage(session), session, cancellation)
             .ConfigureAwait(false);
+        return (document, version);
     }
 
     protected override async Task<TDoc?> applyPendingEventsAsync(DocumentSessionBase session, TId streamId,

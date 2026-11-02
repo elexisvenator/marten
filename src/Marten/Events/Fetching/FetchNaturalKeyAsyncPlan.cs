@@ -21,8 +21,8 @@ using System.Diagnostics.CodeAnalysis;
 namespace Marten.Events.Fetching;
 
 /// <summary>
-/// An Async snapshot lags its stream until the daemon catches up, so the fetch reads the stored snapshot and
-/// the events after it, as <see cref="FetchAsyncPlan{TDoc,TId}"/> does, and folds them together.
+/// An Async snapshot lags its stream until the daemon catches up, so the fetch reads the events after the
+/// stored snapshot, then the snapshot, as <see cref="FetchAsyncPlan{TDoc,TId}"/> does, and folds them together.
 /// </summary>
 [UnconditionalSuppressMessage("Trimming", "IL2026",
     Justification = "Class-level: as FetchAsyncPlan. Aggregate types are preserved at the projection-registration boundary.")]
@@ -33,9 +33,10 @@ internal class FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TId>: FetchNaturalKey
 {
     private readonly IAggregator<TDoc, TId, IQuerySession> _aggregator;
     private readonly IDocumentStorage<TDoc, TId> _storage;
-    private readonly string _deltaJoinSql;
     private readonly string _aggregateTypeName = typeof(TDoc).FullNameInCode();
     private string? _initialSql;
+    private string? _selectedEventFields;
+    private int _eventFieldCount;
 
     /// <param name="storage">IdentityOnly storage, as for <see cref="FetchAsyncPlan{TDoc,TId}"/>: its
     /// selector records the snapshot's revision, which the snapshot race detection reads.</param>
@@ -49,15 +50,9 @@ internal class FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TId>: FetchNaturalKey
                       ?? typeof(IdentityForwardingAggregator<,,,>)
                           .CloseAndBuildAs<IAggregator<TDoc, TId, IQuerySession>>(raw, _storage, typeof(TDoc),
                               _storage.IdType, typeof(TId), typeof(IQuerySession));
-
-        _deltaJoinSql = events.TenancyStyle == TenancyStyle.Single || IsGlobal
-            ? $" left outer join {storage.TableName.QualifiedName} as a on d.stream_id = a.id where (a.mt_version is NULL or d.version > a.mt_version) and d.stream_id = "
-            : $" left outer join {storage.TableName.QualifiedName} as a on d.stream_id = a.id and d.tenant_id = a.tenant_id where (a.mt_version is NULL or d.version > a.mt_version) and d.stream_id = ";
     }
 
     public override ProjectionLifecycle Lifecycle => ProjectionLifecycle.Async;
-
-    protected override bool SharesOneSnapshot => true;
 
     protected override bool UsesWriteCache => true;
 
@@ -106,8 +101,12 @@ internal class FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TId>: FetchNaturalKey
 
     private void ensureInitialSql(IEventStorage selector)
     {
-        _initialSql ??=
-            $"select {selector.SelectFields().Select(x => "d." + x).Join(", ")} from {_events.DatabaseSchemaName}.mt_events as d";
+        if (_initialSql != null) return;
+
+        var fields = selector.SelectFields();
+        _eventFieldCount = fields.Length;
+        _selectedEventFields = fields.Select(x => "d." + x).Join(", ");
+        _initialSql = $"select {_selectedEventFields} from {_events.DatabaseSchemaName}.mt_events as d";
     }
 
     protected override void forgetSnapshot(DocumentSessionBase session, TId streamId)
@@ -119,69 +118,120 @@ internal class FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TId>: FetchNaturalKey
         // A batch enlists without going through prepareAsync
         ensureInitialSql(session.EventStorage());
 
-        if (cached == null)
-        {
-            builder.StartNewCommand();
-            writeDocumentLoad(builder, _storage, session, keyValue);
-        }
-
         builder.StartNewCommand();
 
-        builder.Append(_initialSql!);
-        if (cached == null)
+        if (cached != null)
         {
-            builder.Append(_deltaJoinSql);
-            _lookup.WriteStreamIdSubselect(builder, keyValue);
-        }
-        else
-        {
-            // The baseline version is known, so the delta needs no join to the aggregate table
+            // The baseline version is known, so the delta needs no snapshot read
+            builder.Append(_initialSql!);
             builder.Append(" where d.stream_id = ");
             _lookup.WriteStreamIdSubselect(builder, keyValue);
             builder.Append(" and d.version > ");
             builder.AppendParameter(cached.Version);
+            writeEventTenancyFilter(builder);
+            builder.Append(" order by d.seq_id");
+            return;
         }
 
+        // The events first, then the snapshot, as FetchAsyncPlan reads them
+        writeEventFetchStatement(builder, keyValue);
+
+        builder.StartNewCommand();
+        writeDocumentLoad(builder, _storage, session, keyValue);
+    }
+
+    /// <summary>
+    /// The events after the snapshot, and the snapshot version they start after (the floor), as
+    /// FetchAsyncPlan.writeEventFetchStatement writes them, with the key's stream id subselect in place of the
+    /// stream id. With no events, or no stream with the key, the left join still returns one row, so the floor
+    /// always comes back.
+    /// </summary>
+    private void writeEventFetchStatement(ICommandBuilder builder, object keyValue)
+    {
+        builder.Append("with floor as (select coalesce((select a.mt_version from ");
+        builder.Append(_storage.TableName.QualifiedName);
+        builder.Append(" as a where a.id = ");
+        _lookup.WriteStreamIdSubselect(builder, keyValue);
+        if (isConjoined)
+        {
+            builder.Append(" and a.tenant_id = ");
+            builder.AppendParameter(builder.TenantId);
+        }
+
+        builder.Append("), 0) as version) select ");
+        builder.Append(_selectedEventFields!);
+        builder.Append(", floor.version from floor left outer join ");
+        builder.Append(_events.DatabaseSchemaName);
+        builder.Append(".mt_events as d on d.stream_id = ");
+        _lookup.WriteStreamIdSubselect(builder, keyValue);
+        builder.Append(" and d.version > floor.version");
+        writeEventTenancyFilter(builder);
+        builder.Append(" order by d.seq_id");
+    }
+
+    private bool isConjoined => _events.TenancyStyle == TenancyStyle.Conjoined && !IsGlobal;
+
+    private void writeEventTenancyFilter(ICommandBuilder builder)
+    {
         // You must do this for performance even if the stream ids were magically unique across tenants
-        if (_events.TenancyStyle == TenancyStyle.Conjoined && !IsGlobal)
+        if (isConjoined)
         {
             builder.Append(" and d.tenant_id = ");
             builder.AppendParameter(builder.TenantId);
         }
-
-        builder.Append(" order by d.seq_id");
     }
 
-    protected override async Task<TDoc?> readAggregateAsync(DbDataReader reader, DocumentSessionBase session,
-        bool found, TId streamId, long version, bool detectSnapshotRace, CachedSnapshot? cached,
-        CancellationToken cancellation)
+    private async Task<FetchAsyncPlan<TDoc, TId>.Delta> readDeltaAsync(DbDataReader reader,
+        DocumentSessionBase session, CancellationToken cancellation)
+    {
+        var selector = (ISelector<IEvent>)session.EventStorage();
+        var events = new List<IEvent>();
+        long floor = 0;
+        while (await reader.ReadAsync(cancellation).ConfigureAwait(false))
+        {
+            floor = await reader.GetFieldValueAsync<long>(_eventFieldCount, cancellation).ConfigureAwait(false);
+
+            // An empty delta still returns its floor, on one row with no event in it
+            if (await reader.IsDBNullAsync(0, cancellation).ConfigureAwait(false)) continue;
+
+            events.Add(await selector.ResolveAsync(reader, cancellation).ConfigureAwait(false));
+        }
+
+        return new FetchAsyncPlan<TDoc, TId>.Delta(events, floor);
+    }
+
+    protected override async Task<(TDoc? aggregate, long version)> readAggregateAsync(DbDataReader reader,
+        DocumentSessionBase session, bool found, TId streamId, long version, bool detectSnapshotRace,
+        CachedSnapshot? cached, CancellationToken cancellation)
     {
         TDoc? document;
+        IReadOnlyList<IEvent> events;
+
+        await reader.NextResultAsync(cancellation).ConfigureAwait(false);
         if (cached != null)
         {
             document = cached.Aggregate;
+            events = await new ListQueryHandler<IEvent>(null, session.EventStorage())
+                .HandleAsync(reader, session, cancellation).ConfigureAwait(false);
         }
         else
         {
+            // The events after the snapshot, then the snapshot itself
+            var delta = await readDeltaAsync(reader, session, cancellation).ConfigureAwait(false);
+
             await reader.NextResultAsync(cancellation).ConfigureAwait(false);
             document = await readDocumentAsync(reader, _storage, session, cancellation).ConfigureAwait(false);
+
+            if (!found) return (default, version);
+
+            var snapshotVersion = FetchAsyncPlan<TDoc, TId>.snapshotVersionFor(session, streamId);
+            events = FetchAsyncPlan<TDoc, TId>.eventsAfterSnapshot(streamId, document != null, snapshotVersion,
+                delta, detectSnapshotRace);
+            version = FetchAsyncPlan<TDoc, TId>.reachedVersion(version, document != null, snapshotVersion, events);
         }
-
-        await reader.NextResultAsync(cancellation).ConfigureAwait(false);
-        var events = await new ListQueryHandler<IEvent>(null, session.EventStorage())
-            .HandleAsync(reader, session, cancellation).ConfigureAwait(false);
-
-        if (!found) return default;
 
         _events.Options.OpenTelemetry
             .RecordEventsReplayed(events.Count, _aggregateTypeName, OpenTelemetryOptions.AsyncPlan);
-
-        // #5613: see FetchAsyncPlan.snapshotAndDeltaDisagree. Only the writing paths detect, as there.
-        if (detectSnapshotRace &&
-            FetchAsyncPlan<TDoc, TId>.snapshotAndDeltaDisagree(session, streamId, version, document, events))
-        {
-            throw new SnapshotRaceException(typeof(TDoc), streamId);
-        }
 
         if (events.Any())
         {
@@ -194,7 +244,7 @@ internal class FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TId>: FetchNaturalKey
             _storage.SetIdentity(document, streamId);
         }
 
-        return document;
+        return (document, version);
     }
 
     protected override async Task<TDoc?> applyPendingEventsAsync(DocumentSessionBase session, TId streamId,
