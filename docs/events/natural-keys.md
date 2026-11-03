@@ -133,6 +133,10 @@ The fetch APIs take `TKey` only. `FetchForWriting<T, TKey?>`, `FetchLatest<T, TK
 an `ArgumentException`. A null key can't match a stream, and you know when you have one, so check for null and
 fetch by its value.
 
+A null key, or a strong-typed key whose value is null such as `default` of a struct wrapping a `string`, is
+treated like an empty `Guid` or a null `string` stream id. `FetchForWriting`, `FetchForExclusiveWriting` and
+their batch forms throw an `ArgumentOutOfRangeException`. `FetchLatest` returns `null` without a query.
+
 <!-- snippet: sample_nullable_natural_key_aggregate -->
 <a id='snippet-sample_nullable_natural_key_aggregate'></a>
 ```cs

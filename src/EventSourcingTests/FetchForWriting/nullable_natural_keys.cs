@@ -136,6 +136,39 @@ public class nullable_natural_keys: OneOffConfigurationsContext
     }
 
     [Fact]
+    public async Task a_null_key_is_refused_for_writing_and_finds_nothing_for_reading()
+    {
+        StoreOptions(opts =>
+        {
+            opts.Projections.Snapshot<Product>(SnapshotLifecycle.Inline);
+            opts.Projections.Snapshot<OrderAggregate>(SnapshotLifecycle.Inline);
+        });
+
+        // As an empty Guid or a null string stream id is: no stream to load, and no key for a new one to claim.
+        // default(Sku) is a key whose value is null, which is what a missing value binds to.
+        await Should.ThrowAsync<ArgumentOutOfRangeException>(() =>
+            theSession.Events.FetchForWriting<Product, Sku>(default));
+        await Should.ThrowAsync<ArgumentOutOfRangeException>(() =>
+            theSession.Events.FetchForWriting<Product, Sku>(default, 1));
+        await Should.ThrowAsync<ArgumentOutOfRangeException>(() =>
+            theSession.Events.FetchForExclusiveWriting<Product, Sku>(default));
+        await Should.ThrowAsync<ArgumentOutOfRangeException>(() =>
+            theSession.Events.FetchForWriting<OrderAggregate, OrderNumber>(null!));
+
+        var batch = theSession.CreateBatchQuery();
+        Should.Throw<ArgumentOutOfRangeException>(() => batch.Events.FetchForWriting<Product, Sku>(default));
+
+        // A read finds nothing, without a query
+        (await theSession.Events.FetchLatest<Product, Sku>(default)).ShouldBeNull();
+        (await theSession.Events.FetchLatest<OrderAggregate, OrderNumber>(null!)).ShouldBeNull();
+
+        var reads = theSession.CreateBatchQuery();
+        var latest = reads.Events.FetchLatest<Product, Sku>(default);
+        await reads.Execute();
+        (await latest).ShouldBeNull();
+    }
+
+    [Fact]
     public async Task a_source_returning_the_nullable_key_renames_the_stream()
     {
         StoreOptions(opts => opts.Projections.Snapshot<Product>(SnapshotLifecycle.Inline));

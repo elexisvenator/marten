@@ -5,6 +5,7 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using JasperFx;
+using JasperFx.Core.Reflection;
 using JasperFx.Events;
 using JasperFx.Events.Aggregation;
 using JasperFx.Events.Fetching;
@@ -190,6 +191,12 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
 
     protected object keyValueFor(TNaturalKey id) => _naturalKey.Unwrap(id)!;
 
+    /// <summary>
+    /// A null key, or a strong-typed key whose value is null. No stream can have it, so a read finds nothing
+    /// without a query and a write is refused.
+    /// </summary>
+    private bool isNullKey(TNaturalKey id) => id is null || _naturalKey.Unwrap(id) is null;
+
     private AggregateCacheKey cacheKeyFor(DocumentSessionBase session, object id)
     {
         return new AggregateCacheKey(
@@ -201,9 +208,24 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
 
     #region writing
 
+    /// <summary>
+    /// A null key is refused the way an empty Guid or a null string stream id is: there is no stream to load,
+    /// and no key for a new stream to claim. That includes a strong-typed key whose value is null, which is what
+    /// <c>default</c> of a struct wrapping a string is.
+    /// </summary>
+    private void assertKeyForWriting(TNaturalKey id)
+    {
+        if (isNullKey(id))
+        {
+            throw new ArgumentOutOfRangeException(nameof(id),
+                $"Cannot use a null natural key of type {typeof(TNaturalKey).FullNameInCode()} to fetch {typeof(TDoc).FullNameInCode()} for writing");
+        }
+    }
+
     public async Task<IEventStream<TDoc>> FetchForWriting(DocumentSessionBase session, TNaturalKey id,
         bool forUpdate, CancellationToken cancellation = default)
     {
+        assertKeyForWriting(id);
         return await withSnapshotRaceRedos(session,
             detect => fetchForWritingWithCache(session, id, forUpdate, detect, cancellation)).ConfigureAwait(false);
     }
@@ -421,6 +443,8 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
     private async Task<(bool found, TId streamId, long version, TDoc? aggregate)> fetchForReading(
         DocumentSessionBase session, TNaturalKey id, bool detectSnapshotRace, CancellationToken cancellation)
     {
+        if (isNullKey(id)) return (false, default!, 0, default);
+
         await prepareAsync(session, cancellation).ConfigureAwait(false);
 
         var keyValue = keyValueFor(id);
@@ -515,6 +539,7 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
         long expectedStartingVersion)
     {
         session.AssertIsDocumentSession();
+        assertKeyForWriting(id);
         return new StreamHandler(this, id, false, expectedStartingVersion);
     }
 
@@ -522,11 +547,14 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
         bool forUpdate)
     {
         session.AssertIsDocumentSession();
+        assertKeyForWriting(id);
         return new StreamHandler(this, id, forUpdate, null);
     }
 
     public IQueryHandler<TDoc?> BuildQueryHandler(QuerySession session, TNaturalKey id)
     {
+        if (isNullKey(id)) return new PreCannedQueryHandler<TDoc?>(default);
+
         // As FetchInlinedPlan does for a stream id: an aggregate already in the identity map needs no query
         if (session is DocumentSessionBase dsb && dsb.Options.Events.UseIdentityMapForAggregates &&
             keyValueFor(id) is { } keyValue && tryFindInIdentityMap(dsb, keyValue, out var inMap))
