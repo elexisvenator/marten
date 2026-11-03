@@ -38,6 +38,13 @@ public class mapped_natural_key_compliance
     : MappedNaturalKeyCompliance<MartenComplianceFixture, IDocumentOperations, IQuerySession>;
 
 /// <summary>
+///     The natural keys a store refuses when it is built, and the TKey / TKey? mixes it accepts, owned and
+///     mapped.
+/// </summary>
+public class natural_key_registration_compliance
+    : NaturalKeyRegistrationCompliance<MartenComplianceFixture, IDocumentOperations, IQuerySession>;
+
+/// <summary>
 ///     jasperfx#754. The AggregateToAsync half: folding an ad hoc raw-event query into a single
 ///     aggregate over Marten's derived live aggregator, with identity stamped from the stream.
 /// </summary>
