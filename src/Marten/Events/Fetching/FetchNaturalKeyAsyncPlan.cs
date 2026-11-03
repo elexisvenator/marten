@@ -38,8 +38,9 @@ internal class FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TId>: FetchNaturalKey
     private string? _selectedEventFields;
     private int _eventFieldCount;
 
-    /// <param name="storage">IdentityOnly storage, as for <see cref="FetchAsyncPlan{TDoc,TId}"/>: its
-    /// selector records the snapshot's revision, which the snapshot race detection reads.</param>
+    /// <param name="storage">Storage with <c>DocumentTracking.None</c>, as for <see cref="FetchAsyncPlan{TDoc,TId}"/>:
+    /// every fold gets its own document, and the selector records the snapshot's revision, which the snapshot race
+    /// detection reads.</param>
     public FetchNaturalKeyAsyncPlan(EventGraph events, NaturalKeyDefinition naturalKey,
         NaturalKeyQueryBuilder lookup, IDocumentStorage<TDoc, TId> storage): base(events, naturalKey, lookup)
     {
@@ -110,7 +111,7 @@ internal class FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TId>: FetchNaturalKey
     }
 
     protected override void forgetSnapshot(DocumentSessionBase session, TId streamId)
-        => FetchAsyncPlan<TDoc, TId>.forgetSnapshot(session, streamId);
+        => FetchAsyncPlan<TDoc, TId>.forgetSnapshot(_storage, session, streamId);
 
     protected override void writeAggregateStatements(ICommandBuilder builder, QuerySession session,
         object keyValue, CachedSnapshot? cached)
@@ -197,7 +198,9 @@ internal class FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TId>: FetchNaturalKey
             events.Add(await selector.ResolveAsync(reader, cancellation).ConfigureAwait(false));
         }
 
-        return new FetchAsyncPlan<TDoc, TId>.Delta(events, floor);
+        // The floor is found through the key's stream id subselect, which joins mt_streams, so a floor always
+        // has its stream: a stream that is gone takes its key with it, and the fetch starts a new stream
+        return new FetchAsyncPlan<TDoc, TId>.Delta(events, floor, StreamExists: true);
     }
 
     protected override async Task<(TDoc? aggregate, long version)> readAggregateAsync(DbDataReader reader,
@@ -213,6 +216,9 @@ internal class FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TId>: FetchNaturalKey
             document = cached.Aggregate;
             events = await new ListQueryHandler<IEvent>(null, session.EventStorage())
                 .HandleAsync(reader, session, cancellation).ConfigureAwait(false);
+
+            // An event appended between the two reads is in the events, so the aggregate is at its version
+            version = FetchAsyncPlan<TDoc, TId>.reachedVersion(version, false, null, events);
         }
         else
         {
@@ -224,7 +230,7 @@ internal class FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TId>: FetchNaturalKey
 
             if (!found) return (default, version);
 
-            var snapshotVersion = FetchAsyncPlan<TDoc, TId>.snapshotVersionFor(session, streamId);
+            var snapshotVersion = FetchAsyncPlan<TDoc, TId>.snapshotVersionFor(_storage, session, streamId);
             events = FetchAsyncPlan<TDoc, TId>.eventsAfterSnapshot(streamId, document != null, snapshotVersion,
                 delta, detectSnapshotRace);
             version = FetchAsyncPlan<TDoc, TId>.reachedVersion(version, document != null, snapshotVersion, events);

@@ -11,6 +11,7 @@ using JasperFx.Events;
 using Marten.Exceptions;
 using Marten.Internal;
 using Marten.Internal.Sessions;
+using Marten.Internal.Storage;
 using Marten.Linq.QueryHandlers;
 using Marten.Services;
 using Marten.Services.BatchQuerying;
@@ -39,7 +40,7 @@ internal partial class FetchAsyncPlan<TDoc, TId>
     ///     <see cref="SnapshotRaceException" />, and once more with detection off when the redos run out.
     ///     See <see cref="SnapshotRaceRedos" />.
     /// </summary>
-    private static async Task<T> withSnapshotRaceRedos<T>(DocumentSessionBase session, TId id,
+    private async Task<T> withSnapshotRaceRedos<T>(DocumentSessionBase session, TId id,
         Func<bool, Task<T>> fetch)
     {
         for (var attempt = 0; attempt < SnapshotRaceRedos; attempt++)
@@ -78,8 +79,8 @@ internal partial class FetchAsyncPlan<TDoc, TId>
             {
                 // The snapshot went backwards between this batch's two reads, as it does while a projection
                 // is rebuilt. Nothing is wrong with the stream; the read just straddled the write. Go round
-                // again -- but the redo has to forget what the first attempt learned first, or it reads the
-                // same stale snapshot straight back out of the session.
+                // again -- but the redo has to forget what the first attempt learned first, or a snapshot that
+                // has since gone is judged by the revision of the one that was there.
                 forgetSnapshot(session, id);
             }
         }
@@ -90,25 +91,26 @@ internal partial class FetchAsyncPlan<TDoc, TId>
     }
 
     /// <summary>
-    ///     Drops this stream's snapshot from the session's identity map and revision tracker so that a redo
-    ///     actually goes back to the database for it.
+    ///     Drops this stream's snapshot from the session's revision tracker, so that a redo judges only what
+    ///     it reads itself.
     /// </summary>
     /// <remarks>
-    ///     This plan resolves its storage with <c>DocumentTracking.IdentityOnly</c>, so the selector behind
-    ///     <see cref="LoadByIdHandler{T,TId}" /> is an identity-map selector: a second load of the same id in
-    ///     the same session hands back the FIRST instance and never reads the row again. Without this a redo
-    ///     is guaranteed to observe exactly the stale state that triggered it, the race detector fires again,
-    ///     and the retry budget is spent discovering nothing. Scoped to the one id -- EjectAllOfType would
-    ///     also throw away other streams' identity and any pending work queued against the type.
+    ///     Only the revision. The plan reads with <c>DocumentTracking.None</c> (see <see cref="AsyncFetchPlanner" />),
+    ///     so a redo goes back to the row regardless, and whatever is in the session's identity map for this id
+    ///     is the caller's own document rather than anything this fetch put there.
     /// </remarks>
-    internal static void forgetSnapshot(DocumentSessionBase session, TId id)
-    {
-        if (session.ItemMap.TryGetValue(typeof(TDoc), out var raw) && raw is Dictionary<TId, TDoc> map)
-        {
-            map.Remove(id);
-        }
+    private void forgetSnapshot(DocumentSessionBase session, TId id) => forgetSnapshot(_storage, session, id);
 
-        ((IMartenSession)session).Versions.RevisionsFor<TDoc, TId>().Remove(id);
+    internal static void forgetSnapshot(IDocumentStorage<TDoc, TId> storage, DocumentSessionBase session, TId id)
+    {
+        if (storage is IValueTypeRevisions<TId> wrapped)
+        {
+            wrapped.ClearRevision(session, id);
+        }
+        else
+        {
+            ((IMartenSession)session).Versions.ClearRevision<TDoc, TId>(id);
+        }
     }
 
     [MemberNotNull(nameof(_initialSql))]
@@ -267,6 +269,9 @@ internal partial class FetchAsyncPlan<TDoc, TId>
                 // Read in any events from after the cached state of the aggregate
                 await reader.NextResultAsync(cancellation).ConfigureAwait(false);
                 events = await new ListQueryHandler<IEvent>(null, selector).HandleAsync(reader, session, cancellation).ConfigureAwait(false);
+
+                // An event appended between the two reads is in the events, so the aggregate is at its version
+                version = reachedVersion(version, false, null, events);
             }
             else
             {

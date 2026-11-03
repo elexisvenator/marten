@@ -69,8 +69,9 @@ internal class NaturalKeyFetchPlanner: IFetchPlanner
         if (projection.Lifecycle == ProjectionLifecycle.Async &&
             options.Storage.FindMapping(typeof(TDoc)) is DocumentMapping { Metadata.Revision.Enabled: true })
         {
+            // Never through the identity map, as for AsyncFetchPlanner: the events are folded onto this document
             return new FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TStreamId>(events, naturalKey, builder,
-                options.ResolveCorrectedDocumentStorage<TDoc, TStreamId>(DocumentTracking.IdentityOnly));
+                options.ResolveCorrectedDocumentStorage<TDoc, TStreamId>(DocumentTracking.None));
         }
 
         IIdentitySetter<TDoc, TStreamId> identitySetter = new NulloIdentitySetter<TDoc, TStreamId>();
