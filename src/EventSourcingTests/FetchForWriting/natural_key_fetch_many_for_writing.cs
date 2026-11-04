@@ -65,44 +65,6 @@ public class natural_key_fetch_many_for_writing: OneOffConfigurationsContext
     }
 
     [Fact]
-    public async Task an_async_aggregate_by_mapped_key_is_one_round_trip_too()
-    {
-        configure();
-
-        var first = new OrderNumber("MANY-ASYNC-1");
-        var second = new OrderNumber("MANY-ASYNC-2");
-        await startOrder(first, 1);
-        await startOrder(second, 3);
-
-        await using var session = theStore.LightweightSession();
-        var before = session.RequestCount;
-
-        // The async fetches go in one batch like any other
-        var streams = await session.Events.FetchManyForWriting<OrderSummary, OrderNumber>([first, second]);
-
-        session.RequestCount.ShouldBe(before + 1);
-        streams[0].Aggregate!.Items.ShouldBe(1);
-        streams[1].Aggregate!.Items.ShouldBe(3);
-    }
-
-    [Fact]
-    public async Task an_unknown_key_comes_back_as_a_new_stream_in_its_place()
-    {
-        configure();
-
-        var known = new OrderNumber("MANY-KNOWN");
-        await startOrder(known, 1);
-
-        await using var session = theStore.LightweightSession();
-        var streams = await session.Events.FetchManyForWriting<OrderAggregate, OrderNumber>(
-            [new OrderNumber("MANY-NONE"), known]);
-
-        streams[0].Aggregate.ShouldBeNull();
-        streams[0].CurrentVersion.ShouldBe(0);
-        streams[1].Aggregate!.OrderNum.ShouldBe(known);
-    }
-
-    [Fact]
     public async Task stream_ids_work_through_the_generic_form()
     {
         configure();

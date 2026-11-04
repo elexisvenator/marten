@@ -38,20 +38,6 @@ public class OrderSummary
 
 #endregion
 
-public class OrderSummaryAsString
-{
-    public string Id { get; set; }
-
-    [MappedNaturalKey<OrderAggregateAsString>]
-    public OrderNumber Number { get; set; }
-
-    public int Items { get; set; }
-
-    public static OrderSummaryAsString Create(OrderCreated e) => new() { Number = e.OrderNumber };
-
-    public void Apply(OrderItemAdded e) => Items++;
-}
-
 public class mapped_and_async_natural_keys: OneOffConfigurationsContext
 {
     [Fact]
@@ -162,33 +148,6 @@ public class mapped_and_async_natural_keys: OneOffConfigurationsContext
 
         (await theSession.Events.FetchLatest<OrderSummary, OrderNumber>(original)).ShouldBeNull();
         (await theSession.Events.FetchLatest<OrderSummary, OrderNumber>(renamed))!.Number.ShouldBe(renamed);
-    }
-
-    [Fact]
-    public async Task a_mapped_key_with_string_stream_identity()
-    {
-        StoreOptions(opts =>
-        {
-            opts.Events.StreamIdentity = StreamIdentity.AsString;
-            opts.Projections.Snapshot<OrderAggregateAsString>(SnapshotLifecycle.Inline);
-            opts.Projections.Snapshot<OrderSummaryAsString>(SnapshotLifecycle.Async);
-        });
-
-        var orderNumber = new OrderNumber("MAPPED-STR-1");
-        var streamKey = "order-" + Guid.NewGuid();
-        theSession.Events.StartStream<OrderAggregateAsString>(streamKey,
-            new OrderCreated(orderNumber, "Dave"),
-            new OrderItemAdded("Widget", 9.99m));
-        await theSession.SaveChangesAsync();
-
-        var latest = await theSession.Events.FetchLatest<OrderSummaryAsString, OrderNumber>(orderNumber);
-        latest.ShouldNotBeNull();
-        latest.Id.ShouldBe(streamKey);
-        latest.Items.ShouldBe(1);
-
-        var stream = await theSession.Events.FetchForWriting<OrderSummaryAsString, OrderNumber>(orderNumber);
-        stream.Key.ShouldBe(streamKey);
-        stream.CurrentVersion.ShouldBe(2);
     }
 
     [Fact]

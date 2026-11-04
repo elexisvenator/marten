@@ -13,6 +13,24 @@ using Xunit;
 
 namespace EventSourcingTests.FetchForWriting;
 
+public enum KeyChange
+{
+    Renamed,
+
+    /// <summary>The key set back to a value of null, which retires it.</summary>
+    Retired
+}
+
+/// <summary>How a key change is appended.</summary>
+public enum ChangedThrough
+{
+    /// <summary>A fetch for writing by stream id, which goes through the write cache.</summary>
+    Fetch,
+
+    /// <summary>A plain append, which leaves the key's pointer to the cache stale.</summary>
+    Append
+}
+
 public enum ByWhat
 {
     StreamId,
@@ -187,5 +205,87 @@ public class natural_key_cache_and_identity_map_matrix: OneOffConfigurationsCont
             latest.DCount.ShouldBe(0);
             latest.BCount.ShouldBe(1);
         }
+    }
+
+    public static IEnumerable<object[]> KeyChangeCases() =>
+        from lifecycle in new[] { SnapshotLifecycle.Inline, SnapshotLifecycle.Async }
+        from seed in new[] { ByWhat.StreamId, ByWhat.NaturalKey }
+        from change in Enum.GetValues<KeyChange>()
+        from through in Enum.GetValues<ChangedThrough>()
+        select new object[] { lifecycle, seed, change, through };
+
+    [Theory]
+    [MemberData(nameof(KeyChangeCases))]
+    public async Task a_changed_key_is_not_answered_by_its_old_value(SnapshotLifecycle lifecycle, ByWhat seed,
+        KeyChange change, ChangedThrough through)
+    {
+        StoreOptions(opts =>
+        {
+            opts.Projections.Snapshot<KeyedSimpleAggregate>(lifecycle);
+            opts.Events.AggregateWriteCaching.Cache = theCache;
+            opts.Events.CacheAggregatesForWriting<KeyedSimpleAggregate>();
+        });
+
+        var streamId = await startAsync();
+        var oldKey = RaceKey.For(streamId);
+
+        // Cached, with the old key pointing at it
+        await using (var seeding = theStore.LightweightSession())
+        {
+            var stream = await fetchForWritingAsync(seeding, seed, streamId);
+            stream.AppendOne(new BEvent());
+            await seeding.SaveChangesAsync();
+        }
+
+        var newKey = change == KeyChange.Renamed ? new RaceKey("K-NEW-" + streamId) : new RaceKey(null!);
+        await using (var changing = theStore.LightweightSession())
+        {
+            if (through == ChangedThrough.Fetch)
+            {
+                var stream = await changing.Events.FetchForWriting<KeyedSimpleAggregate>(streamId);
+                stream.AppendOne(new KeyedAEvent(newKey));
+            }
+            else
+            {
+                changing.Events.Append(streamId, new KeyedAEvent(newKey));
+            }
+
+            await changing.SaveChangesAsync();
+        }
+
+        if (change == KeyChange.Retired)
+        {
+            // Another stream claims the key the first one gave up
+            var claimant = Guid.NewGuid();
+            theSession.Events.StartStream<KeyedSimpleAggregate>(claimant, new KeyedAEvent(oldKey), new CEvent());
+            await theSession.SaveChangesAsync();
+
+            await using var claiming = theStore.LightweightSession();
+            var claimed = await claiming.Events.FetchForWriting<KeyedSimpleAggregate, RaceKey>(oldKey);
+            claimed.Id.ShouldBe(claimant);
+            claimed.CurrentVersion.ShouldBe(2);
+            claimed.Aggregate!.CCount.ShouldBe(1);
+            claimed.Aggregate.BCount.ShouldBe(0);
+            (await claiming.Events.FetchLatest<KeyedSimpleAggregate, RaceKey>(oldKey))!.Id.ShouldBe(claimant);
+            return;
+        }
+
+        await using var session = theStore.LightweightSession();
+
+        // No stream has the old key, so this is a new stream...
+        var byOldKey = await session.Events.FetchForWriting<KeyedSimpleAggregate, RaceKey>(oldKey);
+        byOldKey.Aggregate.ShouldBeNull();
+        byOldKey.CurrentVersion.ShouldBe(0);
+        (await session.Events.FetchLatest<KeyedSimpleAggregate, RaceKey>(oldKey)).ShouldBeNull();
+
+        // ...and whatever the old key's pointer led to is still in the cache for its own stream
+        theCache.Keys.ShouldContain(x => streamId.Equals(x.Id));
+
+        var byNewKey = await session.Events.FetchForWriting<KeyedSimpleAggregate, RaceKey>(newKey);
+        byNewKey.Id.ShouldBe(streamId);
+        byNewKey.CurrentVersion.ShouldBe(5);
+        byNewKey.Aggregate!.ACount.ShouldBe(2);
+        byNewKey.Aggregate.BCount.ShouldBe(2);
+        byNewKey.Aggregate.Key.ShouldBe(newKey);
     }
 }

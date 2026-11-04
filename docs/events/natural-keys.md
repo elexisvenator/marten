@@ -373,7 +373,7 @@ opts.Projections.Snapshot<OrderAggregate>(SnapshotLifecycle.Inline);
 // ...and the async view is fetched through it
 opts.Projections.Snapshot<OrderSummary>(SnapshotLifecycle.Async);
 ```
-<sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/mapped_and_async_natural_keys.cs#L110-L116' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_registering_mapped_natural_key_projections' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/mapped_and_async_natural_keys.cs#L96-L102' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_registering_mapped_natural_key_projections' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 Mapped keys suit an `Async` read model well. The owner keeps the lookup current inline, so the read model can
@@ -385,7 +385,7 @@ be fetched by the key straight away, before the daemon has caught up:
 // Current state, whether or not the daemon has caught up yet
 var latest = await theSession.Events.FetchLatest<OrderSummary, OrderNumber>(orderNumber);
 ```
-<sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/mapped_and_async_natural_keys.cs#L127-L130' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_fetch_async_aggregate_by_mapped_natural_key' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/mapped_and_async_natural_keys.cs#L113-L116' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_fetch_async_aggregate_by_mapped_natural_key' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 An aggregate can map any number of keys, alongside at most one key it owns, as long as every key has a

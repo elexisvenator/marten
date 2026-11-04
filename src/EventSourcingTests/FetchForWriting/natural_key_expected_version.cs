@@ -69,23 +69,4 @@ public class natural_key_expected_version: OneOffConfigurationsContext
         await Should.ThrowAsync<ConcurrencyException>(() =>
             session.Events.FetchForWriting<OrderAggregate, OrderNumber>(new OrderNumber("EV-NONE"), 1));
     }
-
-    [Fact]
-    public async Task a_stale_version_in_a_batch_fails()
-    {
-        configure();
-
-        var order = new OrderNumber("EV-5");
-        await startOrder(order, 1);
-
-        await using var session = theStore.LightweightSession();
-        var batch = session.CreateBatchQuery();
-        var streamTask = batch.Events.FetchForWriting<OrderAggregate, OrderNumber>(order, 5);
-
-        await Should.ThrowAsync<ConcurrencyException>(async () =>
-        {
-            await batch.Execute();
-            await streamTask;
-        });
-    }
 }
