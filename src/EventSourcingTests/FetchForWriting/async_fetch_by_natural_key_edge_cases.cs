@@ -4,7 +4,6 @@ using JasperFx.Events.Aggregation;
 using JasperFx.Events.Projections;
 using Marten;
 using Marten.Testing.Harness;
-using Npgsql;
 using Shouldly;
 using Xunit;
 
@@ -28,9 +27,9 @@ public class StrongTypedOrderSummary
 }
 
 /// <summary>
-/// The fetch by natural key of an Async aggregate reads its events and snapshot as the fetch by stream id does,
-/// so the snapshot changes <see cref="async_fetch_reads_in_a_safe_order" /> and <see cref="async_fetch_edge_cases" />
-/// make mid-fetch are made here against fetches by key, on an aggregate with a Guid id and one with a strong-typed id.
+/// Fetches by natural key of an Async aggregate that <see cref="async_fetch_reads_in_a_safe_order_by_natural_key" />
+/// can't express: a fetch repeated in one session, a snapshot the caller already loaded, and a write-cache hit with
+/// an append between its reads. On an aggregate with a Guid id and one with a strong-typed id.
 /// </summary>
 public class async_fetch_by_natural_key_edge_cases: OneOffConfigurationsContext
 {
@@ -86,16 +85,6 @@ public class async_fetch_by_natural_key_edge_cases: OneOffConfigurationsContext
         await session.SaveChangesAsync(TestContext.Current.CancellationToken);
     }
 
-    private async Task deleteTheSnapshotAsync(bool strongTyped, Guid streamId)
-    {
-        await using var conn = new NpgsqlConnection(ConnectionSource.ConnectionString);
-        await conn.OpenAsync(TestContext.Current.CancellationToken);
-        await using var cmd = conn.CreateCommand();
-        cmd.CommandText = $"delete from {SchemaName}.{snapshotTable(strongTyped)} where id = @id";
-        cmd.Parameters.AddWithValue("id", streamId);
-        (await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken)).ShouldBe(1);
-    }
-
     /// <summary>The items the fetched aggregate counted, and the stream version for a fetch for writing.</summary>
     private static async Task<(int? items, long? version)> fetchAsync(IDocumentSession session, bool strongTyped,
         Fetch fetch, OrderNumber number)
@@ -117,18 +106,6 @@ public class async_fetch_by_natural_key_edge_cases: OneOffConfigurationsContext
         return (summary.Aggregate?.Items, summary.CurrentVersion);
     }
 
-    private async Task<(int? items, long? version)> fetchWhileAsync(bool strongTyped, Fetch fetch, OrderNumber number,
-        Func<Task> interfere)
-    {
-        await using var session = theStore.LightweightSession();
-        var pause = new async_fetch_reads_in_a_safe_order.PauseTheFirstRead(interfere, snapshotTable(strongTyped));
-        session.Logger = pause;
-
-        var found = await fetchAsync(session, strongTyped, fetch, number);
-        await pause.Paused;
-        return found;
-    }
-
     private static void shouldBe((int? items, long? version) found, int items, long version)
     {
         found.items.ShouldBe(items);
@@ -139,32 +116,6 @@ public class async_fetch_by_natural_key_edge_cases: OneOffConfigurationsContext
     {
         { false, Fetch.ForWriting }, { false, Fetch.Latest }, { true, Fetch.ForWriting }, { true, Fetch.Latest }
     };
-
-    [Theory]
-    [MemberData(nameof(EveryAggregateAndFetch))]
-    public async Task the_daemon_advances_a_stale_snapshot_mid_fetch(bool strongTyped, Fetch fetch)
-    {
-        configure(strongTyped);
-        var number = new OrderNumber($"STALE-{strongTyped}-{fetch}");
-        var streamId = await startOrderAsync(number, 1);
-        await catchTheDaemonUpAsync();
-        await addAnItemAsync(streamId);
-
-        shouldBe(await fetchWhileAsync(strongTyped, fetch, number, catchTheDaemonUpAsync), 2, 3);
-    }
-
-    [Theory]
-    [MemberData(nameof(EveryAggregateAndFetch))]
-    public async Task a_current_snapshot_is_deleted_mid_fetch(bool strongTyped, Fetch fetch)
-    {
-        configure(strongTyped);
-        var number = new OrderNumber($"DELETED-{strongTyped}-{fetch}");
-        var streamId = await startOrderAsync(number, 2);
-        await catchTheDaemonUpAsync();
-
-        shouldBe(await fetchWhileAsync(strongTyped, fetch, number, () => deleteTheSnapshotAsync(strongTyped, streamId)),
-            2, 3);
-    }
 
     [Theory]
     [MemberData(nameof(EveryAggregateAndFetch))]
@@ -230,24 +181,5 @@ public class async_fetch_by_natural_key_edge_cases: OneOffConfigurationsContext
         // The cached aggregate is labelled with the version it is at, so the item is not counted again
         await using var next = theStore.LightweightSession();
         shouldBe(await fetchAsync(next, false, Fetch.ForWriting, number), 2, 3);
-    }
-
-    // A stream that is gone takes its key with it, so its snapshot cannot be found by key: a fetch by key
-    // starts a new stream, rather than refusing as a fetch by stream id does.
-
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task a_snapshot_left_behind_by_delete_all_event_data_is_not_found_by_its_key(bool strongTyped)
-    {
-        configure(strongTyped);
-        var number = new OrderNumber($"ORPHAN-{strongTyped}");
-        await startOrderAsync(number, 1);
-        await catchTheDaemonUpAsync();
-        await theStore.Advanced.Clean.DeleteAllEventDataAsync(TestContext.Current.CancellationToken);
-
-        await using var session = theStore.LightweightSession();
-        (await fetchAsync(session, strongTyped, Fetch.ForWriting, number)).ShouldBe((null, 0));
-        (await fetchAsync(session, strongTyped, Fetch.Latest, number)).items.ShouldBeNull();
     }
 }

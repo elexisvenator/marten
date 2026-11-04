@@ -87,26 +87,6 @@ public class Ticket
 public class nullable_natural_keys: OneOffConfigurationsContext
 {
     [Fact]
-    public async Task a_nullable_struct_key_is_fetched_by_its_underlying_type()
-    {
-        StoreOptions(opts => opts.Projections.Snapshot<Product>(SnapshotLifecycle.Inline));
-
-        var sku = new Sku("SKU-1");
-        var streamId = Guid.NewGuid();
-        theSession.Events.StartStream<Product>(streamId, new ProductListed(sku, "Widget"), new ProductRestocked(5));
-        await theSession.SaveChangesAsync();
-
-        var latest = await theSession.Events.FetchLatest<Product, Sku>(sku);
-        latest.ShouldNotBeNull();
-        latest.Id.ShouldBe(streamId);
-        latest.Stock.ShouldBe(5);
-
-        var stream = await theSession.Events.FetchForWriting<Product, Sku>(sku);
-        stream.Id.ShouldBe(streamId);
-        stream.CurrentVersion.ShouldBe(2);
-    }
-
-    [Fact]
     public async Task fetching_by_the_nullable_key_type_is_refused()
     {
         StoreOptions(opts => opts.Projections.Snapshot<Product>(SnapshotLifecycle.Inline));

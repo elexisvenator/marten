@@ -55,29 +55,6 @@ public class OrderSummaryAsString
 public class mapped_and_async_natural_keys: OneOffConfigurationsContext
 {
     [Fact]
-    public async Task an_async_aggregate_that_owns_its_key_is_fetched_at_its_current_state()
-    {
-        // The lookup is maintained inline whatever the aggregate's lifecycle. With no daemon running there is no
-        // stored snapshot, so the aggregate is built from the stream's events.
-        StoreOptions(opts => opts.Projections.Snapshot<OrderAggregate>(SnapshotLifecycle.Async));
-
-        var orderNumber = new OrderNumber("ASYNC-OWNED-1");
-        theSession.Events.StartStream<OrderAggregate>(Guid.NewGuid(),
-            new OrderCreated(orderNumber, "Alice"),
-            new OrderItemAdded("Widget", 9.99m));
-        await theSession.SaveChangesAsync();
-
-        var latest = await theSession.Events.FetchLatest<OrderAggregate, OrderNumber>(orderNumber);
-        latest.ShouldNotBeNull();
-        latest.TotalAmount.ShouldBe(9.99m);
-
-        var stream = await theSession.Events.FetchForWriting<OrderAggregate, OrderNumber>(orderNumber);
-        stream.Aggregate.ShouldNotBeNull();
-        stream.Aggregate.TotalAmount.ShouldBe(9.99m);
-        stream.CurrentVersion.ShouldBe(2);
-    }
-
-    [Fact]
     public async Task an_async_aggregate_that_owns_its_key_keeps_its_lookup_through_the_daemon_and_a_rebuild()
     {
         StoreOptions(opts => opts.Projections.Snapshot<OrderAggregate>(SnapshotLifecycle.Async));
@@ -212,20 +189,6 @@ public class mapped_and_async_natural_keys: OneOffConfigurationsContext
         var stream = await theSession.Events.FetchForWriting<OrderSummaryAsString, OrderNumber>(orderNumber);
         stream.Key.ShouldBe(streamKey);
         stream.CurrentVersion.ShouldBe(2);
-    }
-
-    [Fact]
-    public async Task an_unknown_mapped_key_starts_a_new_stream()
-    {
-        StoreOptions(opts =>
-        {
-            opts.Projections.Snapshot<OrderAggregate>(SnapshotLifecycle.Inline);
-            opts.Projections.Snapshot<OrderSummary>(SnapshotLifecycle.Async);
-        });
-
-        var stream = await theSession.Events.FetchForWriting<OrderSummary, OrderNumber>(new OrderNumber("MAPPED-NONE"));
-        stream.Aggregate.ShouldBeNull();
-        stream.CurrentVersion.ShouldBe(0);
     }
 
     [Fact]

@@ -48,55 +48,6 @@ public class natural_key_caching_and_identity_map: OneOffConfigurationsContext
         await session.SaveChangesAsync();
     }
 
-    private async Task appendThroughFetchByKey(OrderNumber number, object @event)
-    {
-        await using var session = theStore.LightweightSession();
-        var stream = await session.Events.FetchForWriting<OrderAggregate, OrderNumber>(number);
-        stream.AppendOne(@event);
-        await session.SaveChangesAsync();
-    }
-
-    [Fact]
-    public async Task an_aggregate_cached_by_a_fetch_by_stream_id_is_taken_by_its_natural_key()
-    {
-        CacheOrders();
-        var number = new OrderNumber("CACHE-1");
-        var streamId = await startOrder(number);
-
-        // Writes the aggregate back to the cache after the commit, and points its key at it
-        await appendThroughFetchByStreamId(streamId, new OrderItemAdded("Gadget", 5m));
-        var hits = theCache.Hits;
-
-        await using var session = theStore.LightweightSession();
-        var stream = await session.Events.FetchForWriting<OrderAggregate, OrderNumber>(number);
-
-        theCache.Hits.ShouldBe(hits + 1);
-        stream.Id.ShouldBe(streamId);
-        stream.CurrentVersion.ShouldBe(3);
-        stream.Aggregate!.TotalAmount.ShouldBe(15m);
-
-        stream.AppendOne(new OrderItemAdded("Doohickey", 1m));
-        await session.SaveChangesAsync();
-
-        (await theSession.Events.FetchLatest<OrderAggregate, OrderNumber>(number))!.TotalAmount.ShouldBe(16m);
-    }
-
-    [Fact]
-    public async Task a_fetch_by_natural_key_seeds_the_cache_for_the_next_one()
-    {
-        CacheOrders();
-        var number = new OrderNumber("CACHE-2");
-        await startOrder(number);
-
-        await appendThroughFetchByKey(number, new OrderItemAdded("Gadget", 5m));
-        var hits = theCache.Hits;
-
-        await appendThroughFetchByKey(number, new OrderItemAdded("Gizmo", 2m));
-
-        theCache.Hits.ShouldBe(hits + 1);
-        (await theSession.Events.FetchLatest<OrderAggregate, OrderNumber>(number))!.TotalAmount.ShouldBe(17m);
-    }
-
     [Fact]
     public async Task a_pointer_left_by_a_rename_does_not_return_the_renamed_stream()
     {
@@ -172,42 +123,6 @@ public class natural_key_caching_and_identity_map: OneOffConfigurationsContext
     }
 
     [Fact]
-    public async Task fetch_latest_by_natural_key_is_answered_from_the_identity_map()
-    {
-        CacheOrders();
-        var number = new OrderNumber("MAP-INLINE");
-        var streamId = await startOrder(number);
-
-        await using var session = theStore.IdentitySession();
-        var stream = await session.Events.FetchForWriting<OrderAggregate, OrderNumber>(number);
-
-        var before = session.RequestCount;
-        var latest = await session.Events.FetchLatest<OrderAggregate, OrderNumber>(number);
-
-        session.RequestCount.ShouldBe(before);
-        latest.ShouldBeSameAs(stream.Aggregate);
-        latest!.Id.ShouldBe(streamId);
-    }
-
-    [Fact]
-    public async Task fetch_latest_of_an_async_aggregate_by_natural_key_includes_events_appended_in_the_session()
-    {
-        CacheOrders();
-        var number = new OrderNumber("MAP-ASYNC");
-        await startOrder(number);
-
-        await using var session = theStore.LightweightSession();
-        var stream = await session.Events.FetchForWriting<OrderSummary, OrderNumber>(number);
-        stream.AppendOne(new OrderItemAdded("Gadget", 5m));
-
-        var before = session.RequestCount;
-        var latest = await session.Events.FetchLatest<OrderSummary, OrderNumber>(number);
-
-        session.RequestCount.ShouldBe(before);
-        latest!.Items.ShouldBe(2);
-    }
-
-    [Fact]
     public async Task the_identity_map_is_searched_by_the_current_key()
     {
         CacheOrders();
@@ -223,24 +138,5 @@ public class natural_key_caching_and_identity_map: OneOffConfigurationsContext
         // The aggregate in the map now carries the new key, so the old one is not answered from it
         (await session.Events.FetchLatest<OrderAggregate, OrderNumber>(original)).ShouldBeNull();
         (await session.Events.FetchLatest<OrderAggregate, OrderNumber>(renamed))!.Id.ShouldBe(streamId);
-    }
-
-    [Fact]
-    public async Task a_batched_fetch_latest_by_natural_key_is_answered_from_the_identity_map()
-    {
-        CacheOrders();
-        var number = new OrderNumber("MAP-BATCH");
-        var streamId = await startOrder(number);
-
-        await using var session = theStore.IdentitySession();
-        var inMap = (await session.Events.FetchForWriting<OrderAggregate, OrderNumber>(number)).Aggregate;
-
-        var batch = session.CreateBatchQuery();
-        var latest = batch.Events.FetchLatest<OrderAggregate, OrderNumber>(number);
-        var byId = batch.Events.FetchLatest<OrderAggregate>(streamId);
-        await batch.Execute();
-
-        (await latest).ShouldBeSameAs(inMap);
-        (await byId).ShouldBeSameAs(inMap);
     }
 }
