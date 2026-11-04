@@ -204,7 +204,7 @@ internal class FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TId>: FetchNaturalKey
     }
 
     protected override async Task<(TDoc? aggregate, long version)> readAggregateAsync(DbDataReader reader,
-        DocumentSessionBase session, bool found, TId streamId, long version, bool detectSnapshotRace,
+        DocumentSessionBase session, bool found, TId streamId, object? keyValue, long version, bool detectSnapshotRace,
         CachedSnapshot? cached, CancellationToken cancellation)
     {
         TDoc? document;
@@ -229,6 +229,13 @@ internal class FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TId>: FetchNaturalKey
             document = await readDocumentAsync(reader, _storage, session, cancellation).ConfigureAwait(false);
 
             if (!found) return (default, version);
+
+            // The snapshot's revision is recorded under its own stream, so a snapshot of the stream the key moved
+            // to has none under this one. The fetch is redone, as the check after the reads would have it.
+            if (document != null && !EqualityComparer<TId>.Default.Equals(_storage.Identity(document), streamId))
+            {
+                throw new NaturalKeyMovedException(typeof(TDoc), keyValue);
+            }
 
             var snapshotVersion = FetchAsyncPlan<TDoc, TId>.snapshotVersionFor(_storage, session, streamId);
             events = FetchAsyncPlan<TDoc, TId>.eventsAfterSnapshot(streamId, document != null, snapshotVersion,

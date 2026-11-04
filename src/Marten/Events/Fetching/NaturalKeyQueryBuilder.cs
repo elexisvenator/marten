@@ -50,6 +50,17 @@ internal class NaturalKeyQueryBuilder
     }
 
     /// <summary>
+    /// <c>select nk.stream_id</c> for the key's live stream, read after the aggregate to check that the key still
+    /// names the stream <see cref="WriteVersionAndStreamId"/> found.
+    /// </summary>
+    public void WriteStreamId(ICommandBuilder builder, object keyValue)
+    {
+        builder.Append("select nk.");
+        builder.Append(_streamIdColumn);
+        writeFromAndWhere(builder, keyValue);
+    }
+
+    /// <summary>
     /// <c>(select nk.stream_id ...)</c>, to compare a stream id column against.
     /// </summary>
     public void WriteStreamIdSubselect(ICommandBuilder builder, object keyValue)

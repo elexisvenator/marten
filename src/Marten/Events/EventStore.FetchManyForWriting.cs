@@ -111,10 +111,11 @@ internal partial class EventStore
         {
             await batch.Execute(cancellation).ConfigureAwait(false);
         }
-        catch (SnapshotRaceException)
+        catch (Exception e) when (e is SnapshotRaceException or NaturalKeyMovedException)
         {
-            // An Async snapshot went backwards mid-batch, as it does while a projection is rebuilt. A batch
-            // cannot redo one fetch, but the single-stream fetch can, so fall back to one per stream.
+            // An Async snapshot went backwards mid-batch, as it does while a projection is rebuilt, or a natural
+            // key changed hands while it was read. A batch cannot redo one fetch, but the single-stream fetch
+            // can, so fall back to one per stream.
             // Nothing was handed out yet, so the abandoned batch items are never observed.
             var sequential = new IEventStream<T>[identities.Count];
             for (var i = 0; i < identities.Count; i++)

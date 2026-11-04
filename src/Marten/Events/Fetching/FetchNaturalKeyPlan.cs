@@ -101,7 +101,7 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
     /// <paramref name="version"/> when the reads after the version row saw events appended since.
     /// </summary>
     protected abstract Task<(TDoc? aggregate, long version)> readAggregateAsync(DbDataReader reader, DocumentSessionBase session, bool found,
-        TId streamId, long version, bool detectSnapshotRace, CachedSnapshot? cached, CancellationToken cancellation);
+        TId streamId, object? keyValue, long version, bool detectSnapshotRace, CachedSnapshot? cached, CancellationToken cancellation);
 
     /// <summary>
     /// Folds this session's pending events for the stream into the aggregate, for <see cref="ProjectLatest"/>.
@@ -226,31 +226,44 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
         bool forUpdate, CancellationToken cancellation = default)
     {
         assertKeyForWriting(id);
-        return await withSnapshotRaceRedos(session,
+        return await withRedos(session,
             detect => fetchForWritingWithCache(session, id, forUpdate, detect, cancellation)).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// How many times a fetch is redone after <see cref="NaturalKeyMovedException"/> before the exception reaches
+    /// the caller. Each redo needs the key to change hands again inside one round trip.
+    /// </summary>
+    private const int KeyMovedRedos = 3;
 
     /// <summary>
     /// Runs <paramref name="fetch"/> with snapshot race detection on, redoing it after a
     /// <see cref="SnapshotRaceException"/>, and once more with detection off when the redos run out. Only the
     /// Async plan detects the race. See FetchAsyncPlan.SnapshotRaceRedos for why two redos, and why the last
-    /// attempt runs with detection off.
+    /// attempt runs with detection off. A <see cref="NaturalKeyMovedException"/> is redone too, up to
+    /// <see cref="KeyMovedRedos"/> times, and never with its detection off.
     /// </summary>
-    private async Task<T> withSnapshotRaceRedos<T>(DocumentSessionBase session, Func<bool, Task<T>> fetch)
+    private async Task<T> withRedos<T>(DocumentSessionBase session, Func<bool, Task<T>> fetch)
     {
-        for (var attempt = 0; attempt < 2; attempt++)
+        var snapshotRaces = 0;
+        var keyMoves = 0;
+        while (true)
         {
+            var detectSnapshotRace = snapshotRaces < 2;
             try
             {
-                return await fetch(true).ConfigureAwait(false);
+                return await fetch(detectSnapshotRace).ConfigureAwait(false);
             }
-            catch (SnapshotRaceException e)
+            catch (SnapshotRaceException e) when (detectSnapshotRace)
             {
                 forgetSnapshot(session, (TId)e.Id);
+                snapshotRaces++;
+            }
+            catch (NaturalKeyMovedException) when (keyMoves < KeyMovedRedos)
+            {
+                keyMoves++;
             }
         }
-
-        return await fetch(false).ConfigureAwait(false);
     }
 
     public async Task<IEventStream<TDoc>> FetchForWriting(DocumentSessionBase session, TNaturalKey id,
@@ -403,7 +416,7 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
             if (inMap) return fromMap;
         }
 
-        var (found, _, _, aggregate) = await withSnapshotRaceRedos(session,
+        var (found, _, _, aggregate) = await withRedos(session,
             detect => fetchForReading(session, id, detect, cancellation)).ConfigureAwait(false);
         return found ? aggregate : default;
     }
@@ -417,7 +430,7 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
         // events for it are folded in, even when they change the key: the old key still finds the stream,
         // and returns the aggregate under its new key, while the new key finds nothing until the commit.
         // Not exposed publicly: there is no ProjectLatest<T, TId> on IEventStoreOperations.
-        var (found, streamId, _, aggregate) = await withSnapshotRaceRedos(session,
+        var (found, streamId, _, aggregate) = await withRedos(session,
             detect => fetchForReading(session, id, detect, cancellation)).ConfigureAwait(false);
         if (!found) return default;
 
@@ -462,6 +475,11 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
         _lookup.WriteVersionAndStreamId(builder, keyValue, forUpdate);
 
         writeAggregateStatements(builder, session, keyValue, cached);
+
+        // Every statement resolves the key for itself, so the key is resolved once more after the aggregate's
+        // reads: when it still names the stream the first statement found, so did every read in between
+        builder.StartNewCommand();
+        _lookup.WriteStreamId(builder, keyValue);
     }
 
     private async Task<(bool found, TId streamId, long version, TDoc? aggregate)> readFetchAsync(
@@ -486,10 +504,33 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
         }
 
         // A cached snapshot is never checked for a race, as on the stream-id plans: it was not read beside a delta
-        var (aggregate, reached) = await readAggregateAsync(reader, session, found, streamId, version,
+        var (aggregate, reached) = await readAggregateAsync(reader, session, found, streamId, keyValue, version,
             detectSnapshotRace && cached == null, cached, cancellation).ConfigureAwait(false);
 
+        await assertKeyStillNamesTheStreamAsync(reader, found, streamId, keyValue, cancellation).ConfigureAwait(false);
+
         return (found, streamId, reached, aggregate);
+    }
+
+    /// <summary>
+    /// Reads the last statement of the fetch, which resolves the key again. A key that no longer names the stream
+    /// the first statement found changed hands while the fetch ran, and the reads in between may describe another
+    /// stream, or none.
+    /// </summary>
+    private async Task assertKeyStillNamesTheStreamAsync(DbDataReader reader, bool found, TId streamId,
+        object? keyValue, CancellationToken cancellation)
+    {
+        await reader.NextResultAsync(cancellation).ConfigureAwait(false);
+
+        // A key that named no stream at the start is answered as a new stream, whatever the reads after it saw:
+        // nothing is read for a stream that was not found
+        if (!found) return;
+
+        var unchanged = await reader.ReadAsync(cancellation).ConfigureAwait(false) &&
+                        EqualityComparer<TId>.Default.Equals(
+                            await reader.GetFieldValueAsync<TId>(0, cancellation).ConfigureAwait(false), streamId);
+
+        if (!unchanged) throw new NaturalKeyMovedException(typeof(TDoc), keyValue!);
     }
 
     /// <summary>

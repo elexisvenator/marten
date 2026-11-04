@@ -420,6 +420,11 @@ await batch.Execute();
 <sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/batch_querying_by_natural_key.cs#L51-L62' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_batch_fetch_by_natural_key' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
+A fetch by natural key checks, at the end of its round trip, that the key still names the stream it found
+at the start. When another session moved the key to a different stream, or retired it, in between, a fetch on
+its own is redone. A batch can't redo one fetch, so it throws a `NaturalKeyMovedException` instead; retry the
+batch. `FetchManyForWriting` falls back to fetching each stream on its own.
+
 ## FetchManyForWriting by Natural Key
 
 `FetchManyForWriting<T, TKey>` fetches several streams for writing in one round trip, by a natural key, a

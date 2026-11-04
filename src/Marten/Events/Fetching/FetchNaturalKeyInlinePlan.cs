@@ -91,7 +91,7 @@ internal class FetchNaturalKeyInlinePlan<TDoc, TNaturalKey, TId>: FetchNaturalKe
     }
 
     protected override async Task<(TDoc? aggregate, long version)> readAggregateAsync(DbDataReader reader, DocumentSessionBase session,
-        bool found, TId streamId, long version, bool detectSnapshotRace, CachedSnapshot? cached,
+        bool found, TId streamId, object? keyValue, long version, bool detectSnapshotRace, CachedSnapshot? cached,
         CancellationToken cancellation)
     {
         if (cached != null)
