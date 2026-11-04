@@ -447,8 +447,8 @@ public class ProjectionOptions: ProjectionGraph<IProjection, IDocumentOperations
     /// <summary>
     /// A natural key of the store's own stream identity type, a bare <c>string</c> on a string-identity store,
     /// can never be fetched by: <c>FetchForWriting&lt;T, string&gt;</c> and the other fetches by <c>string</c>
-    /// are fetches by stream key there (see <c>EventStore.IsNaturalKeyIdentity</c>). It used to look up the
-    /// key as a stream key and silently find nothing, or start a new stream named after it. A bare
+    /// are fetches by stream key there (see <c>EventStore.IsNaturalKeyIdentity</c>), which would silently find
+    /// nothing, or start a new stream named after the key. A bare
     /// <c>string</c> key on a Guid-identity store is unaffected (#5344).
     /// </summary>
     internal void AssertNaturalKeysAreNotStreamIdentities()

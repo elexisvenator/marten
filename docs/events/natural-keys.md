@@ -480,30 +480,6 @@ The JasperFx source generator reports natural key mistakes as compiler errors, a
 | `JFXEVT014` | Wolverine's `[WriteAggregate<TKey>]`, `[ReadAggregate<TKey>]`, `[WriteModel<TKey>]` or `[ReadModel<TKey>]` (or `NaturalKey = typeof(TKey)`) names a key type the aggregate doesn't have |
 | `JFXEVT015` | One of those attributes names `TKey?` instead of `TKey` |
 
-::: warning Breaking changes
-These were accepted silently before, and now fail:
-
-- More than one `[NaturalKey]` owned by one aggregate. Only the first was ever used. Map the others with
-  `[MappedNaturalKey<T>]` to the aggregate that owns them.
-- A non-public `[NaturalKeySource]` method, which was never bound.
-- Two `[NaturalKeySource]` methods for the same event that derive the key differently. Which one won
-  depended on reflection order.
-- `[NaturalKeySource]` methods on an aggregate that only has mapped keys, which were never used.
-- An owned `[NaturalKey]` that no event sets: no `[NaturalKeySource]` and no `NaturalKeyFor()` registration.
-  Its lookup was never written, so fetching by it always found nothing. A mapped key needs neither, because its
-  source projection maintains the lookup. An aggregate auto-registered on its first fetch fails at that fetch.
-- A key type other than `int`, `long` or `string`, or a strong-typed identifier wrapping one of those: a
-  `Guid`, a wrapper around a `Guid`, or a record with more than one member. These used to fail on the first
-  append, with a cast error or a SQL error from writing the lookup row.
-- Fetching by `TKey?` (`FetchForWriting<T, TKey?>`, `FetchLatest<T, TKey?>` and the batch forms). Fetch by
-  `TKey`, after checking for null.
-- A bare `string` key on a store with `StreamIdentity.AsString`. Fetching by it fetched by stream key instead,
-  finding nothing or starting a new stream named after the key.
-
-A source returning `null` for a stream that already has a key now retires the key. Before, the stream stayed
-reachable by its old key.
-:::
-
 ## Integration with Wolverine
 
 Natural keys integrate with Wolverine's aggregate handler workflow. See the [Wolverine documentation on natural keys with Marten](https://wolverinefx.net/guide/durability/marten/event-sourcing.html#natural-keys) for details on how Wolverine resolves natural keys from command properties.

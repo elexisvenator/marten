@@ -36,10 +36,10 @@ namespace Marten.Events.Fetching;
 /// </para>
 /// <para>
 /// The Inline, Async and Live subclasses mirror <see cref="FetchInlinedPlan{TDoc,TId}"/>,
-/// <see cref="FetchAsyncPlan{TDoc,TId}"/> and <see cref="FetchLivePlan{TDoc,TId}"/>. What those plans do
-/// before the first read because they know the stream id up front -- the aggregate write cache and the
-/// identity map short cuts -- has no equivalent here, since the stream id is only known once the batch is
-/// read.
+/// <see cref="FetchAsyncPlan{TDoc,TId}"/> and <see cref="FetchLivePlan{TDoc,TId}"/>, including their write cache
+/// and identity map short cuts. The identity map is searched for an aggregate whose current key matches, and the
+/// write cache is reached through <see cref="NaturalKeyStreamIndex"/>. The key itself is still resolved in the
+/// database, in the same round trip.
 /// </para>
 /// </remarks>
 internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateFetchPlan<TDoc, TNaturalKey>
@@ -428,17 +428,11 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
             .ConfigureAwait(false);
     }
 
-    public virtual async Task<bool> StreamForReading(DocumentSessionBase session, TNaturalKey id,
-        Stream destination, CancellationToken cancellation)
-    {
-        var aggregate = await FetchForReading(session, id, cancellation).ConfigureAwait(false);
-        if (aggregate == null) return false;
-
-        using var buffer = new Services.PooledByteBufferWriter();
-        session.Serializer.WriteTo(buffer, aggregate);
-        await destination.WriteAsync(buffer.WrittenMemory, cancellation).ConfigureAwait(false);
-        return true;
-    }
+    // StreamLatestJson only takes a stream id, so nothing streams an aggregate's JSON by natural key
+    public Task<bool> StreamForReading(DocumentSessionBase session, TNaturalKey id, Stream destination,
+        CancellationToken cancellation)
+        => throw new NotSupportedException(
+            $"Streaming {typeof(TDoc).FullNameInCode()} as JSON by natural key is not supported. Use StreamLatestJson with the stream id.");
 
     private async Task<(bool found, TId streamId, long version, TDoc? aggregate)> fetchForReading(
         DocumentSessionBase session, TNaturalKey id, bool detectSnapshotRace, CancellationToken cancellation)

@@ -24,11 +24,9 @@ internal class NaturalKeyFetchPlanner: IFetchPlanner
         StoreOptions options,
         [NotNullWhen(true)] out IAggregateFetchPlan<TDoc, TId>? plan) where TDoc : class where TId : notnull
     {
-        // #5344: this used to exclude Guid and string outright, on the reasoning that both are stream
-        // identity types handled by the built-in planners. Only one of them is, though -- whichever the
-        // store actually uses. EventStore.IsNaturalKeyIdentity narrows the exclusion to the store's own
-        // stream identity type, which keeps the ambiguous case (a string key on a string-identity store)
-        // resolving to the stream as it always has.
+        // #5344: the built-in planners handle the store's own stream identity type, Guid or string, so only that
+        // type is excluded (EventStore.IsNaturalKeyIdentity). A string key on a Guid-identity store is a natural
+        // key, and a string on a string-identity store resolves to the stream.
         if (EventStore.IsNaturalKeyIdentity<TDoc, TId>(options) &&
             options.Projections.TryFindAggregate(typeof(TDoc), out var projection) &&
             FindNaturalKey(projection, typeof(TId)) is { } naturalKey)

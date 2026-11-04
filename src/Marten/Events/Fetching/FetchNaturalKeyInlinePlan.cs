@@ -76,22 +76,9 @@ internal class FetchNaturalKeyInlinePlan<TDoc, TNaturalKey, TId>: FetchNaturalKe
         return false;
     }
 
-    /// <summary>
-    /// The same choice of storage as <see cref="FetchInlinedPlan{TDoc,TId}"/>.
-    /// </summary>
+    // The same choice of storage as a fetch by stream id
     private static IDocumentStorage<TDoc, TId> findDocumentStorage(QuerySession session)
-    {
-        var options = ((IMartenSession)session).Options;
-        if (options.Events.UseIdentityMapForAggregates)
-        {
-            // Opt into the identity map mechanics for this aggregate type just in case you're using a
-            // lightweight session
-            session.UseIdentityMapFor<TDoc>();
-            return options.ResolveCorrectedDocumentStorage<TDoc, TId>(DocumentTracking.IdentityOnly);
-        }
-
-        return session.StorageFor<TDoc, TId>();
-    }
+        => FetchInlinedPlan<TDoc, TId>.findDocumentStorage(session);
 
     protected override void writeAggregateStatements(ICommandBuilder builder, QuerySession session,
         object keyValue, CachedSnapshot? cached)
@@ -143,20 +130,5 @@ internal class FetchNaturalKeyInlinePlan<TDoc, TNaturalKey, TId>: FetchNaturalKe
         session.EjectAggregateFromIdentityMap<TDoc, TId>(streamId);
 
         return aggregate;
-    }
-
-    /// <summary>
-    /// The stored document is the aggregate, so its JSON streams straight from the database.
-    /// </summary>
-    public override async Task<bool> StreamForReading(DocumentSessionBase session, TNaturalKey id,
-        Stream destination, CancellationToken cancellation)
-    {
-        await prepareAsync(session, cancellation).ConfigureAwait(false);
-
-        // StreamOne needs a plain command, not a batch
-        var builder = new CommandBuilder { TenantId = session.TenantId };
-        writeDocumentLoad(builder, findDocumentStorage(session), session, keyValueFor(id));
-
-        return await session.StreamOne(builder.Compile(), destination, cancellation).ConfigureAwait(false);
     }
 }

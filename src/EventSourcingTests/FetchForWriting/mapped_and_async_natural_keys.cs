@@ -57,8 +57,8 @@ public class mapped_and_async_natural_keys: OneOffConfigurationsContext
     [Fact]
     public async Task an_async_aggregate_that_owns_its_key_is_fetched_at_its_current_state()
     {
-        // The lookup is maintained inline whatever the aggregate's lifecycle, but this used to load the
-        // stored snapshot as is. With no daemon running there is none, so it came back null.
+        // The lookup is maintained inline whatever the aggregate's lifecycle. With no daemon running there is no
+        // stored snapshot, so the aggregate is built from the stream's events.
         StoreOptions(opts => opts.Projections.Snapshot<OrderAggregate>(SnapshotLifecycle.Async));
 
         var orderNumber = new OrderNumber("ASYNC-OWNED-1");
