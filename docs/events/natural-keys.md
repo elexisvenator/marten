@@ -1,6 +1,6 @@
 # Natural Keys
 
-Natural keys let you look up an event stream by a domain-meaningful identifier (like an order number or invoice code) instead of by its internal stream id. Marten maintains a separate lookup table that maps natural key values to stream ids, so you can use `FetchForWriting` and `FetchLatest` with your natural key in a single database round-trip, on its own or as part of a [batch query](#batch-queries).
+Natural keys let you look up an event stream by a domain-meaningful identifier (like an order number or invoice code) instead of by its internal stream id. Marten maintains a separate lookup table that maps natural key values to stream ids, so you can use `FetchForWriting` and `FetchLatest` with your natural key in a single database round-trip.
 
 ## When to Use Natural Keys
 
@@ -13,13 +13,6 @@ Use natural keys when:
 ## Declaring Natural Keys
 
 Mark a property on your aggregate with `[NaturalKey]`, and mark the methods that set or change the key value with `[NaturalKeySource]`:
-
-- The key type is an `int`, `long` or `string`, or a strong-typed identifier wrapping one of those in a single
-  `Value` property. Any other type is refused when the store is built. Prefer the strong-typed identifier.
-- On a store with `StreamIdentity.AsString`, a bare `string` key is refused too: a fetch by `string` there is a
-  fetch by stream key. Wrap the key.
-- Every owned key needs at least one event that sets it, through `[NaturalKeySource]` or `NaturalKeyFor()`.
-  A key no event sets is refused too, because its lookup would never be written.
 
 <!-- snippet: sample_natural_key_aggregate_types -->
 <a id='snippet-sample_natural_key_aggregate_types'></a>
@@ -120,68 +113,6 @@ public record InvoiceCreated(InvoiceNumber Code, decimal Amount);
 
 The `[NaturalKeySource]` attribute tells Marten which `Create` / `Apply` methods produce or change the natural key value. Marten uses this information to keep the lookup table in sync whenever events are appended.
 
-An aggregate can own at most one natural key. It can also borrow keys owned by other aggregates of the same stream, see [Mapped Natural Keys](#mapped-natural-keys). Every key on one aggregate needs a distinct .NET type, because the type is what `FetchForWriting<T, TKey>` and `FetchLatest<T, TKey>` resolve the key by.
-
-### Nullable Keys
-
-A natural key whose type is a struct may be declared nullable: on the aggregate, on an event, or as the return
-type of a `[NaturalKeySource]` method. `TKey` and `TKey?` are the same key wherever either is declared: a
-source returning `TKey` binds to a `TKey?` property and the other way round, and a mapped key may be declared
-nullable where the owner's is not.
-
-The fetch APIs take `TKey` only. `FetchForWriting<T, TKey?>`, `FetchLatest<T, TKey?>` and the batch forms throw
-an `ArgumentException`. A null key can't match a stream, and you know when you have one, so check for null and
-fetch by its value.
-
-A null key, or a strong-typed key whose value is null such as `default` of a struct wrapping a `string`, is
-treated like an empty `Guid` or a null `string` stream id. `FetchForWriting`, `FetchForExclusiveWriting` and
-their batch forms throw an `ArgumentOutOfRangeException`. `FetchLatest` returns `null` without a query.
-
-<!-- snippet: sample_nullable_natural_key_aggregate -->
-<a id='snippet-sample_nullable_natural_key_aggregate'></a>
-```cs
-public readonly record struct Sku(string Value);
-
-public record ProductListed(Sku Sku, string Name);
-
-public record ProductSkuChanged(Sku? NewSku);
-
-public record ProductRestocked(int Quantity);
-
-// The key is a struct, declared nullable on the aggregate, and set by sources returning both Sku and Sku?
-public class Product
-{
-    public Guid Id { get; set; }
-
-    [NaturalKey]
-    public Sku? Sku { get; set; }
-
-    public string Name { get; set; } = string.Empty;
-    public int Stock { get; set; }
-
-    [NaturalKeySource]
-    public static Sku KeyFor(ProductListed e) => e.Sku;
-
-    [NaturalKeySource]
-    public static Sku? KeyFor(ProductSkuChanged e) => e.NewSku;
-
-    public void Apply(ProductListed e)
-    {
-        Sku = e.Sku;
-        Name = e.Name;
-    }
-
-    public void Apply(ProductSkuChanged e) => Sku = e.NewSku;
-
-    public void Apply(ProductRestocked e) => Stock += e.Quantity;
-}
-```
-<sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/nullable_natural_keys.cs#L13-L51' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_nullable_natural_key_aggregate' title='Start of snippet'>anchor</a></sup>
-<!-- endSnippet -->
-
-An aggregate whose key is still `null` has no lookup row, and is only found by its stream id. Setting the key
-back to `null` retires it, see [Null and Default Keys](#null-and-default-keys).
-
 ## Event-to-Key Mappings
 
 Every event type that sets or changes the natural key must be declared through the `[NaturalKeySource]` attribute. When Marten processes events during an append operation, it extracts the key value from these mapped events and writes it to the lookup table.
@@ -224,18 +155,8 @@ method an instance that C# itself would not have let you create. Use strategy 1 
 registration below for those types.
 :::
 
-A source method also has to follow these rules:
-
-- **It has to be public.** Marten only binds public methods, static or instance, on the aggregate or on a
-  separate projection class.
-- **One source per event type.** Two `[NaturalKeySource]` methods for the same event are only allowed when
-  both read the key from the same property of the event. That covers the usual pairing of a `Create` for the
-  first event and an `Apply` for later ones. Otherwise Marten could not tell which of the two keys is meant.
-- **Only an owned key has sources.** An aggregate whose keys are all [mapped](#mapped-natural-keys) is kept in
-  the lookup by the projection that owns the key, so `[NaturalKeySource]` methods on it are an error.
-
-If none of the three strategies can bind a method, or a method breaks one of these rules, Marten throws an
-`InvalidProjectionException` when the projection is registered, naming the method and the reason. (Before Marten 9.20 / JasperFx.Events 2.36.0 an
+If none of the three can bind a method, Marten throws an `InvalidProjectionException` when the projection
+is registered, naming the method and the reason. (Before Marten 9.20 / JasperFx.Events 2.36.0 an
 unbindable method was silently dropped, so the lookup table was simply never written for that event type
 and the first sign of trouble was a natural key lookup returning null at runtime — see
 [JasperFx/jasperfx#569](https://github.com/JasperFx/jasperfx/issues/569).)
@@ -293,23 +214,6 @@ await theSession.SaveChangesAsync();
 
 This resolves the natural key to a stream id and fetches the aggregate in a single database round-trip.
 
-### Expected Version
-
-As with a stream id, you can pass the version you expect the stream to be at. The fetch fails immediately
-with a `ConcurrencyException` if the stream has moved on:
-
-<!-- snippet: sample_fetch_for_writing_by_natural_key_with_expected_version -->
-<a id='snippet-sample_fetch_for_writing_by_natural_key_with_expected_version'></a>
-```cs
-var stream = await session.Events.FetchForWriting<OrderAggregate, OrderNumber>(order, 3);
-```
-<sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/natural_key_expected_version.cs#L45-L47' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_fetch_for_writing_by_natural_key_with_expected_version' title='Start of snippet'>anchor</a></sup>
-<!-- endSnippet -->
-
-A natural key that doesn't match any stream is at version 0. The same overload exists on batch queries,
-`batch.Events.FetchForWriting<T, TNaturalKey>(key, expectedVersion)`. It also works with a strong-typed
-identifier or the stream id itself, because `TId` is any identity the aggregate can be fetched by.
-
 ## FetchLatest by Natural Key
 
 For read-only access, you can use `FetchLatest` with a natural key:
@@ -323,127 +227,6 @@ var aggregate = await theSession.Events.FetchLatest<OrderAggregate, OrderNumber>
 <sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/fetching_by_natural_key.cs#L211-L214' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_marten_fetch_latest_by_natural_key' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
-## Natural Keys on Async Projections
-
-The lookup table is written inline as events are appended, whatever the lifecycle of the aggregate that owns
-the key. An `Async` aggregate can therefore own a natural key like any other. `FetchLatest` and
-`FetchForWriting` by natural key return its current state: they fold the events the daemon has not projected
-yet onto the stored snapshot, exactly as a fetch by stream id does.
-
-## Mapped Natural Keys
-
-Often the natural key belongs to one aggregate, and other read models of the same stream should be found by it
-too. Rather than each of them owning a copy of the key, a read model can *map* its key to the aggregate that
-owns it, with `[MappedNaturalKey<TSource>]` or `[NaturalKey(SourceProjection = typeof(TSource))]`. The source
-is either the owning aggregate or its projection class:
-
-<!-- snippet: sample_mapped_natural_key_aggregate -->
-<a id='snippet-sample_mapped_natural_key_aggregate'></a>
-```cs
-// An async read model of an order stream. It owns no lookup: the order number resolves through
-// OrderAggregate's mt_natural_key table, which OrderAggregate's projection maintains inline.
-public class OrderSummary
-{
-    public Guid Id { get; set; }
-
-    [MappedNaturalKey<OrderAggregate>]
-    public OrderNumber Number { get; set; }
-
-    public int Items { get; set; }
-
-    public static OrderSummary Create(OrderCreated e) => new() { Number = e.OrderNumber };
-
-    public void Apply(OrderItemAdded e) => Items++;
-
-    public void Apply(OrderNumberChanged e) => Number = e.NewOrderNumber;
-}
-```
-<sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/mapped_and_async_natural_keys.cs#L19-L39' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_mapped_natural_key_aggregate' title='Start of snippet'>anchor</a></sup>
-<!-- endSnippet -->
-
-A mapped key has no lookup table of its own. It reads the table of the aggregate that owns the key, so
-register the owner too:
-
-<!-- snippet: sample_registering_mapped_natural_key_projections -->
-<a id='snippet-sample_registering_mapped_natural_key_projections'></a>
-```cs
-// The owner maintains the order number lookup inline...
-opts.Projections.Snapshot<OrderAggregate>(SnapshotLifecycle.Inline);
-
-// ...and the async view is fetched through it
-opts.Projections.Snapshot<OrderSummary>(SnapshotLifecycle.Async);
-```
-<sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/mapped_and_async_natural_keys.cs#L96-L102' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_registering_mapped_natural_key_projections' title='Start of snippet'>anchor</a></sup>
-<!-- endSnippet -->
-
-Mapped keys suit an `Async` read model well. The owner keeps the lookup current inline, so the read model can
-be fetched by the key straight away, before the daemon has caught up:
-
-<!-- snippet: sample_fetch_async_aggregate_by_mapped_natural_key -->
-<a id='snippet-sample_fetch_async_aggregate_by_mapped_natural_key'></a>
-```cs
-// Current state, whether or not the daemon has caught up yet
-var latest = await theSession.Events.FetchLatest<OrderSummary, OrderNumber>(orderNumber);
-```
-<sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/mapped_and_async_natural_keys.cs#L113-L116' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_fetch_async_aggregate_by_mapped_natural_key' title='Start of snippet'>anchor</a></sup>
-<!-- endSnippet -->
-
-An aggregate can map any number of keys, alongside at most one key it owns, as long as every key has a
-distinct type. When the `DocumentStore` is built, Marten checks that each mapped key's source:
-
-- is registered as a projection;
-- owns a natural key (a mapped key cannot read another mapped key);
-- owns a key of the same type, where `TKey` and `TKey?` count as the same;
-- is not the aggregate itself;
-- is a global aggregate exactly when the mapping aggregate is one, because both read the same stream.
-
-## Batch Queries
-
-`FetchForWriting<T, TKey>`, `FetchForExclusiveWriting<T, TKey>` and `FetchLatest<T, TKey>` are also available
-on a batch query, for a natural key, a strong-typed identifier, or the stream id itself. Each natural key
-fetch resolves its key inside the batch, so the whole batch is still one round trip:
-
-<!-- snippet: sample_batch_fetch_by_natural_key -->
-<a id='snippet-sample_batch_fetch_by_natural_key'></a>
-```cs
-var batch = session.CreateBatchQuery();
-
-var summary = batch.Events.FetchLatest<OrderSummary, OrderNumber>(order);
-var owner = batch.Events.FetchLatest<OrderAggregate, OrderNumber>(order);
-var byStreamId = batch.Events.FetchLatest<OrderAggregate>(orderId);
-var invoiceAggregate = batch.Events.FetchLatest<InvoiceAggregate, InvoiceNumber>(invoice);
-var missing = batch.Events.FetchLatest<InvoiceAggregate, InvoiceNumber>(new InvoiceNumber("INV-NONE"));
-
-// One round trip for all five
-await batch.Execute();
-```
-<sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/batch_querying_by_natural_key.cs#L51-L62' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_batch_fetch_by_natural_key' title='Start of snippet'>anchor</a></sup>
-<!-- endSnippet -->
-
-A fetch by natural key checks, at the end of its round trip, that the key still names the stream it found
-at the start. When another session moved the key to a different stream, or retired it, in between, a fetch on
-its own is redone. A batch can't redo one fetch, so it throws a `NaturalKeyMovedException` instead; retry the
-batch. `FetchManyForWriting` falls back to fetching each stream on its own.
-
-## FetchManyForWriting by Natural Key
-
-`FetchManyForWriting<T, TKey>` fetches several streams for writing in one round trip, by a natural key, a
-strong-typed identifier or the stream id itself:
-
-<!-- snippet: sample_fetch_many_for_writing_by_natural_key -->
-<a id='snippet-sample_fetch_many_for_writing_by_natural_key'></a>
-```cs
-var streams = await session.Events.FetchManyForWriting<OrderAggregate, OrderNumber>([first, second]);
-```
-<sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/FetchForWriting/natural_key_fetch_many_for_writing.cs#L47-L49' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_fetch_many_for_writing_by_natural_key' title='Start of snippet'>anchor</a></sup>
-<!-- endSnippet -->
-
-- The handles come back in the order of the keys, each with its own starting version.
-- A key that matches no stream gets a handle with a null aggregate at version 0, as a single
-  `FetchForWriting` would: appending starts the stream.
-- A repeated key is refused, because two handles on one stream would race each other's expected version.
-- The keys are `TKey`, never `TKey?`, and none may be null. Drop the keys you know to be missing first.
-
 ## Mutability
 
 Natural keys can change over the lifetime of a stream. When an event mapped with `[NaturalKeySource]` is appended, Marten updates the lookup table with the new value. The old key value is replaced, so lookups using the previous key will no longer resolve to that stream.
@@ -452,12 +235,7 @@ The retired row is removed rather than left behind, so the previous value immedi
 
 ## Null and Default Keys
 
-When a `[NaturalKeySource]` produces a `null` or default key value, the stream has no natural key:
-
-- A stream whose key has not been assigned yet has no lookup row. It does not appear in natural key lookups,
-  but is still accessible by stream id.
-- A stream whose key is set back to `null` has its lookup row retired. It is no longer found by its old key,
-  and that key is free for another stream to claim. This also holds after a projection rebuild.
+If a mapped event produces a `null` or default key value, Marten silently skips writing to the lookup table. This means streams where the natural key has not yet been assigned will not appear in natural key lookups, but will still be accessible by stream id.
 
 ## Clean and Maintenance Operations
 
@@ -467,24 +245,8 @@ The natural key lookup table is maintained automatically as part of normal event
 
 When writing integration tests:
 
-- The lookup row for a key is written when the session's changes are saved. A stream started in the current, uncommitted session cannot be found by its natural key yet. Once it is committed, `FetchLatest` and `FetchForWriting` by natural key include the session's pending events for it, as a fetch by stream id does
-- `FetchForWriting` with a natural key that does not exist starts a new stream, as it does for a stream id that does not exist. The key is claimed when an event that sets it is appended
-- Natural key fetches use the identity map and aggregate write caching like fetches by stream id do. With `UseIdentityMapForAggregates`, `FetchLatest` by natural key is answered from the session when it already holds the aggregate, matched by its current key. With write caching enabled, `FetchForWriting` by natural key takes the cached snapshot, while the key itself is still resolved in the database in the same round trip
-
-## Build-Time Diagnostics
-
-The JasperFx source generator reports natural key mistakes as compiler errors, ahead of the runtime checks:
-
-| Id | Rule |
-| --- | --- |
-| `JFXEVT010` | An aggregate owns more than one natural key |
-| `JFXEVT011` | Two natural keys on one aggregate share a type (`TKey` and `TKey?` count as the same) |
-| `JFXEVT012` | A mapped key names its own aggregate or projection as its source |
-| `JFXEVT013` | A mapped key's source is not an aggregate projection, or owns no natural key |
-| `JFXEVT014` | A mapped key's source key is itself mapped |
-| `JFXEVT015` | A mapped key's type does not match the type of the key its source owns |
-| `JFXEVT016` | Wolverine's `[WriteAggregate<TKey>]`, `[ReadAggregate<TKey>]`, `[WriteModel<TKey>]` or `[ReadModel<TKey>]` (or `NaturalKey = typeof(TKey)`) names a key type the aggregate doesn't have |
-| `JFXEVT017` | One of those attributes names `TKey?` instead of `TKey` |
+- Natural key lookups work against the same session's uncommitted data, so you can append events and look up by natural key within the same unit of work
+- If you are using `FetchForWriting` with a natural key that does not exist, the behavior is the same as with a stream id that does not exist
 
 ## Integration with Wolverine
 
