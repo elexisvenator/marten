@@ -64,6 +64,12 @@ public class MartenDocumentComplianceFixture: DocumentStorageComplianceFixture
     /// and <c>Metadata.Revision</c>, so the per-tenant revision fact runs rather than skipping.
     /// BuildStoreAsync replays <c>DocumentComplianceConfig.NumericRevisionTypes</c> to match.
     /// </summary>
+    /// <remarks>
+    /// This one flag gates both the per-tenant revision fact of DocumentConjoinedTenancyCompliance AND the whole
+    /// NumericRevisionCompliance suite (enrolled as numeric_revision_compliance in EventSourcingTests). It was
+    /// false from marten#5827 until marten#5788, because Store() on an IRevisioned document ignored its Version
+    /// and the suite failed 6 of its 9 facts.
+    /// </remarks>
     public override bool SupportsNumericRevisions => true;
 
     public override bool SupportsConjoinedDocuments => true;
@@ -227,11 +233,24 @@ public class MartenDocumentComplianceFixture: DocumentStorageComplianceFixture
     protected override async Task BuildStoreAsync(DocumentComplianceConfig config)
     {
         var options = new StoreOptions();
-        options.Connection(ConnectionSource.ConnectionString);
+        // #6101: see ConnectionSource.ComplianceConnectionString
+        options.Connection(ConnectionSource.ComplianceConnectionString);
         options.AutoCreateSchemaObjects = AutoCreate.All;
         options.DisableNpgsqlLogging = true;
         options.NameDataLength = 100;
         options.DatabaseSchemaName = (config.SchemaName ?? "doc_compliance").ToLowerInvariant();
+
+        // The suites treat correlation id, causation id, last modified by and headers as captured only by a
+        // type that asks for them (ITracked, or an explicit mapping). Marten 10 captures them on every
+        // document by default (#5812), so turn them off wherever no member is mapped to them.
+        options.Policies.ForAllDocuments(mapping =>
+        {
+            var metadata = mapping.Metadata;
+            foreach (var column in new[] { metadata.CorrelationId, metadata.CausationId, metadata.LastModifiedBy, metadata.Headers })
+            {
+                if (column.Member == null) column.Enabled = false;
+            }
+        });
 
         // Marten creates document storage on demand, so DocumentTypes is not strictly required
         // here. Registering it anyway means ApplyAllConfiguredChangesToDatabaseAsync below actually

@@ -44,11 +44,12 @@ internal class FetchNaturalKeyInlinePlan<TDoc, TNaturalKey, TId>: FetchNaturalKe
     protected override bool cachedSnapshotFits(long cachedVersion, long streamVersion) =>
         cachedVersion == streamVersion;
 
-    // As FetchInlinedPlan: the commit mutates this instance, so it is written back only after the commit
-    protected override void offerToCache(DocumentSessionBase session, IAggregateWriteCache cache,
-        AggregateCacheKey key, TDoc aggregate, TId streamId, long version)
+    // As FetchInlinedPlan: the commit's own projection moves the aggregate on, so the write-back is advanced to
+    // the instance that projection stores
+    protected override void onOwedToCache(DocumentSessionBase session, AggregateCacheKey key, TId streamId)
     {
-        PendingAggregateCacheWrites.TrackForWriteBack(session, cache, key, aggregate, streamId, version);
+        FetchInlinedPlan<TDoc, TId>.AdvanceAfterCommit(session, findDocumentStorage(session), key, streamId,
+            IsGlobal);
     }
 
     protected override ValueTask<(bool found, TDoc? aggregate)> tryFetchFromIdentityMapAsync(

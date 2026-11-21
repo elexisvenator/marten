@@ -16,6 +16,7 @@ using JasperFx.Core.Reflection;
 using JasperFx.Descriptors;
 using JasperFx.Events;
 using JasperFx.Events.Daemon;
+using JasperFx.Events.Projections;
 using JasperFx.MultiTenancy;
 using Marten.Events;
 using Marten.Events.Projections;
@@ -46,8 +47,6 @@ namespace Marten;
 ///     necessary to customize and bootstrap a working
 ///     DocumentStore
 /// </summary>
-[UnconditionalSuppressMessage("Trimming", "IL2026",
-    Justification = "Class-level: consumes RUC-annotated members (ISerializer, JasperFx.Events aggregator graph, CloseAndBuildAs / GenericFactoryCache fallbacks, FastExpressionCompiler). Document/event/projection types flow in from StoreOptions / Schema.For<T>() / projection registration and are preserved per the AOT publishing guide; AOT consumers supply a source-generator-backed serializer + pre-generated codegen artifacts.")]
 public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDocumentSchemaResolver, IDescribeMyself
 {
     public const int DefaultTimeout = 5;
@@ -375,15 +374,6 @@ public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDoc
 
         WriteResiliencePipeline = builder.AddMartenWriteDefaults().Build();
     }
-
-    /// <summary>
-    /// Direct Marten to use the <= V6 behavior of keeping a connection open
-    /// in an IQuerySession or IDocumentSession upon first usage until the session
-    /// is disposed. In V7 and later, the default behavior is an aggressive "use and close"
-    /// policy that tries to close and released used database connections as soon as possible
-    /// Default is false
-    /// </summary>
-    public bool UseStickyConnectionLifetimes { get; set; } = false;
 
     /// <summary>
     /// The PostgreSQL session setting name used for RLS tenant identification.
@@ -727,6 +717,7 @@ public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDoc
         if (_serializer == null)
         {
             _serializer = SerializerFactory.New();
+            applyV9SerializerDefaults(_serializer);
             foreach (var configure in SerializationConfigurations)
             {
                 configure(_serializer);
@@ -792,6 +783,10 @@ public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDoc
     /// its lifetime.
     /// </summary>
     internal bool OwnsPrimaryDataSource { get; set; } = true;
+
+    // #5898: the data source handed to Connection(NpgsqlDataSource), kept so that a later
+    // ConfigureNpgsqlDataSourceBuilder can rebuild the factory around it rather than discard it.
+    private NpgsqlDataSource? _suppliedDataSource;
     private readonly List<Type> _compiledQueryTypes = new();
 
     /// <summary>
@@ -908,6 +903,9 @@ public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDoc
     /// <param name="connectionString"></param>
     public void DataSourceFactory(INpgsqlDataSourceFactory dataSourceFactory, string? connectionString = null)
     {
+        // A factory chosen here replaces any data source supplied earlier; Connection(NpgsqlDataSource)
+        // records its own afterwards.
+        _suppliedDataSource = null;
         NpgsqlDataSourceFactory = dataSourceFactory;
 
         if (_tenancy == null && connectionString != null)
@@ -978,6 +976,8 @@ public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDoc
             ),
             dataSource.ConnectionString
         );
+
+        _suppliedDataSource = dataSource;
     }
 
     /// <summary>
@@ -1014,8 +1014,18 @@ public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDoc
             return builder;
         };
 
-        // Rebuild the data source factory so it uses the updated builder factory
-        NpgsqlDataSourceFactory = new DefaultNpgsqlDataSourceFactory(NpgsqlDataSourceBuilderFactory);
+        // Rebuild the data source factory so it uses the updated builder factory.
+        //
+        // #5898: but never by discarding a data source the caller supplied. Replacing it with a
+        // DefaultNpgsqlDataSourceFactory made Marten build a second data source from the supplied one's
+        // ConnectionString, which Npgsql has stripped of its password -- "No password has been provided"
+        // -- and which in any case is not the data source the caller configured (auth callbacks, type
+        // mappings, pool settings). DcbStorageMode = HStore calls this, so Connection(dataSource)
+        // followed by HStore mode failed at the first connection. The updated builder factory still
+        // applies to any other connection string, a tenant database for instance.
+        NpgsqlDataSourceFactory = _suppliedDataSource != null
+            ? new SingleNpgsqlDataSourceFactory(NpgsqlDataSourceBuilderFactory, _suppliedDataSource)
+            : new DefaultNpgsqlDataSourceFactory(NpgsqlDataSourceBuilderFactory);
     }
 
     /// <summary>
@@ -1023,6 +1033,12 @@ public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDoc
     /// </summary>
     /// <param name="serializer"></param>
     public void Serializer(ISerializer serializer)
+    {
+        applyV9SerializerDefaults(serializer);
+        setSerializer(serializer);
+    }
+
+    private void setSerializer(ISerializer serializer)
     {
         _serializer = serializer;
 
@@ -1065,10 +1081,13 @@ public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDoc
             EnumStorage = enumStorage, Casing = casing,
         };
 
+        // The V9 default goes on first so the caller's configure can still override it
+        applyV9SerializerDefaults(serializer);
+
         if (configure is not null)
             serializer.Configure(configure);
 
-        Serializer(serializer);
+        setSerializer(serializer);
     }
 
     /// <summary>
@@ -1078,6 +1097,7 @@ public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDoc
     public void Serializer<T>() where T : ISerializer, new()
     {
         _serializer = new T();
+        applyV9SerializerDefaults(_serializer);
         foreach (var configuration in SerializationConfigurations)
         {
             configuration(_serializer);
@@ -1128,6 +1148,120 @@ public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDoc
     }
 
     /// <summary>
+    ///     Put back every <see cref="StoreOptions"/> default that Marten 10 flipped from its V9
+    ///     value. The single opt-out for the 10.0 default flips, the way
+    ///     <see cref="RestoreV8Defaults"/> was for 9.0. Call it first and add your own overrides
+    ///     afterward.
+    /// </summary>
+    /// <remarks>
+    ///     <para>
+    ///     This does not call <see cref="RestoreV8Defaults"/>; chain the two to go back two majors.
+    ///     </para>
+    ///     <para>
+    ///     Every 10.0 default flip must be restored here and listed in the 10.0 section of
+    ///     <c>docs/migration-guide.md</c>; <c>RestoreV9DefaultsTests</c> pins each one.
+    ///     Restored settings:
+    ///     <list type="bullet">
+    ///       <item><see cref="EventGraph.EnableExtendedProgressionTracking"/> &rarr; <c>false</c></item>
+    ///       <item><see cref="EventGraph.DcbConflictScope"/> &rarr; <c>DcbConflictScope.TagValue</c></item>
+    ///       <item>
+    ///         <c>GateSideEffectsBehindPriorVersion</c> &rarr; <c>false</c> on every registered
+    ///         projection (JasperFx 3.0 turned it on, jasperfx#1075). JasperFx has no store-wide
+    ///         switch, so this is applied when the store is built and overrides a projection's own
+    ///         value; to keep the gate on for one projection, do not call this method.
+    ///       </item>
+    ///       <item><see cref="EventGraph.EnableEventSkippingInProjectionsOrSubscriptions"/> &rarr; <c>false</c></item>
+    ///       <item>
+    ///         <see cref="EventGraph.MetadataConfig"/>: causation id, correlation id, headers and user name
+    ///         &rarr; <c>false</c>
+    ///       </item>
+    ///       <item>
+    ///         Document metadata: <c>CausationId</c>, <c>CorrelationId</c>, <c>Headers</c> and
+    ///         <c>LastModifiedBy</c> &rarr; off. Applied when each document mapping is built, so policies,
+    ///         attributes and <c>Schema.For&lt;T&gt;()</c> can still turn one back on.
+    ///       </item>
+    ///       <item>
+    ///         <see cref="OpenTelemetryOptions.EnableEventCounters"/> and
+    ///         <see cref="OpenTelemetryOptions.EnableFetchForWritingMetrics"/> &rarr; <c>false</c>
+    ///       </item>
+    ///       <item>
+    ///         System.Text.Json <c>AllowOutOfOrderMetadataProperties</c> &rarr; <c>false</c>, on the serializer
+    ///         Marten builds and on one you pass to <see cref="Serializer(ISerializer)"/>, whichever is
+    ///         configured first. A <c>configure</c> callback given to
+    ///         <see cref="UseSystemTextJsonForSerialization(EnumStorage, Casing, Action{JsonSerializerOptions})"/>
+    ///         still wins.
+    ///       </item>
+    ///       <item>
+    ///         <see cref="DocumentMapping.StartIndexesByTenantId"/> &rarr; <c>false</c> for conjoined documents,
+    ///         applied when each document mapping is built
+    ///       </item>
+    ///       <item><see cref="EventGraph.EnableSideEffectsOnInlineProjections"/> &rarr; <c>false</c></item>
+    ///       <item>
+    ///         <c>Projections.Errors.ApplyErrors</c> and <c>Projections.Errors.SerializationErrors</c> &rarr;
+    ///         <c>Skip</c> (marten#6003). Marten 10 parks a failing identity, and pauses the shard where it can't park.
+    ///       </item>
+    ///       <item>
+    ///         <see cref="EventGraph.UseArchivedStreamPartitioning"/> and
+    ///         <see cref="EventGraph.EnableStrictStreamIdentityEnforcement"/> &rarr; <c>false</c>
+    ///       </item>
+    ///     </list>
+    ///     </para>
+    /// </remarks>
+    public void RestoreV9Defaults()
+    {
+        V9DefaultsRestored = true;
+
+        Events.EnableExtendedProgressionTracking = false;
+        Events.DcbConflictScope = DcbConflictScope.TagValue;
+        Events.EnableEventSkippingInProjectionsOrSubscriptions = false;
+        Events.EnableSideEffectsOnInlineProjections = false;
+        Events.UseArchivedStreamPartitioning = false;
+        Events.EnableStrictStreamIdentityEnforcement = false;
+
+        var metadata = Events.MetadataConfig;
+        metadata.CausationIdEnabled = false;
+        metadata.CorrelationIdEnabled = false;
+        metadata.HeadersEnabled = false;
+        metadata.UserNameEnabled = false;
+
+        OpenTelemetry.EnableEventCounters = false;
+        OpenTelemetry.EnableFetchForWritingMetrics = false;
+
+        // marten#6003: skip a failing event (and dead-letter it) instead of parking its identity or pausing
+        Projections.Errors.SkipApplyErrors = true;
+        Projections.Errors.SkipSerializationErrors = true;
+
+        if (_serializer != null)
+        {
+            applyV9SerializerDefaults(_serializer);
+        }
+    }
+
+    /// <summary>
+    ///     Set by <see cref="RestoreV9Defaults"/>. Read by the defaults that are decided later than the call:
+    ///     each document mapping's metadata and index defaults, the serializer, and the side-effect gate.
+    /// </summary>
+    internal bool V9DefaultsRestored { get; private set; }
+
+    private void applyV9SerializerDefaults(ISerializer serializer)
+    {
+        if (V9DefaultsRestored && serializer is Marten.Services.SystemTextJsonSerializer stj)
+        {
+            stj.Configure(o => o.AllowOutOfOrderMetadataProperties = false);
+        }
+    }
+
+    internal void ApplyRestoredV9SideEffectGate()
+    {
+        if (!V9DefaultsRestored) return;
+
+        foreach (var projection in Projections.All.OfType<ProjectionBase>())
+        {
+            projection.GateSideEffectsBehindPriorVersion = false;
+        }
+    }
+
+    /// <summary>
     ///     Replace the Marten logging strategy
     /// </summary>
     /// <param name="logger"></param>
@@ -1140,6 +1274,8 @@ public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDoc
 
     internal void ApplyConfiguration()
     {
+        ApplyRestoredV9SideEffectGate();
+
         // 9.0: BuildAllMappings is no longer called here (#4303). Mappings
         // are now materialized lazily on first MappingFor(type) call, with
         // CompileAndValidate moved into that path. This removes a meaningful
@@ -1222,13 +1358,17 @@ public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDoc
         // tables. Sub-partitioning (archive within tenant, or tenant within archive)
         // is a future deliverable — reject the combination at config time rather than
         // emitting a half-coherent schema.
+        // #5812: archived-stream partitioning is on by default since 10.0 and switches itself off under
+        // UseTenantPartitionedEvents, so this only fires when both were asked for explicitly.
         if (Events.UseTenantPartitionedEvents && Events.UseArchivedStreamPartitioning)
         {
             throw new InvalidOperationException(
                 "Events.UseTenantPartitionedEvents currently cannot be combined with " +
                 "Events.UseArchivedStreamPartitioning. Sub-partitioning mt_events / mt_streams " +
                 "by both tenant_id and is_archived is a planned follow-up (see " +
-                "https://github.com/JasperFx/marten/issues/4596). Pick one for now.");
+                "https://github.com/JasperFx/marten/issues/4596). Archived-stream partitioning is " +
+                "already off by default under UseTenantPartitionedEvents; remove the explicit " +
+                "Events.UseArchivedStreamPartitioning = true.");
         }
 
         // #4596 Session 1: per-tenant event partitioning re-uses Marten's existing
@@ -1244,6 +1384,9 @@ public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDoc
         {
             _ = new Schema.MartenManagedTenantListPartitions(this, schemaName: null);
         }
+
+        // #5684: tables registered through Storage.PartitionPerTenant()
+        Storage.ApplyTenantPartitioning(TenantPartitions);
     }
 
     /// <summary>
@@ -1352,7 +1495,6 @@ public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDoc
             });
         }
 
-        //TODO -- V9 change default PrimaryKeyTenancyOrdering to TenantId_Then_Id
         /// <summary>
         ///     Unless explicitly marked otherwise, all documents should
         ///     use conjoined multi-tenancy and opt into using user defined
@@ -1361,13 +1503,13 @@ public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDoc
         /// <param name="configure">Customize the table partitioning on the tenant id</param>
         /// <returns></returns>
         /// <remarks>
-        ///     Uses <see cref="PrimaryKeyTenancyOrdering.Id_Then_TenantId"/> by default for V7-V8 compatibility.
-        ///     This default will change to <see cref="PrimaryKeyTenancyOrdering.TenantId_Then_Id"/> in V9.
-        ///     If you want to opt-in to the V9 default behavior now, use the overload that takes a
-        ///     <see cref="PrimaryKeyTenancyOrdering"/> parameter.
+        ///     Uses <see cref="PrimaryKeyTenancyOrdering.TenantId_Then_Id"/>, the same primary key as the per-document
+        ///     <c>MultiTenantedWithPartitioning()</c>. Before Marten 10 this overload used
+        ///     <see cref="PrimaryKeyTenancyOrdering.Id_Then_TenantId"/>; to keep that primary key, use the overload that
+        ///     takes a <see cref="PrimaryKeyTenancyOrdering"/> parameter.
         /// </remarks>
         public PoliciesExpression AllDocumentsAreMultiTenantedWithPartitioning(Action<PartitioningExpression> configure) =>
-            AllDocumentsAreMultiTenantedWithPartitioning(configure, PrimaryKeyTenancyOrdering.Id_Then_TenantId);
+            AllDocumentsAreMultiTenantedWithPartitioning(configure, PrimaryKeyTenancyOrdering.TenantId_Then_Id);
 
         /// <summary>
         ///     Unless explicitly marked otherwise, all documents should
@@ -1584,14 +1726,18 @@ public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDoc
 
     internal void ApplyMetricsIfAny()
     {
-        if (OpenTelemetry.Applications.Any())
+        OpenTelemetry.ApplyDefaultMetrics();
+
+        if (OpenTelemetry.Applications.Count > 0)
         {
             var logger = DotNetLogger ?? LogFactory?.CreateLogger<MartenCommitMetrics>() ?? NullLogger<MartenCommitMetrics>.Instance;
-            var metrics = new MartenCommitMetrics(logger, OpenTelemetry.Applications);
+            var metrics = new MartenCommitMetrics(logger, OpenTelemetry);
             Listeners.Add(metrics);
         }
     }
 
+    [UnconditionalSuppressMessage("Trimming", "IL2026",
+        Justification = "Consumes RUC-annotated members (ISerializer, JasperFx.Events aggregator graph, CloseAndBuildAs / GenericFactoryCache fallbacks, FastExpressionCompiler). Document/event/projection types flow in from StoreOptions / Schema.For<T>() / projection registration and are preserved per the AOT publishing guide; AOT consumers supply a source-generator-backed serializer + pre-generated codegen artifacts.")]
     OptionsDescription IDescribeMyself.ToDescription()
     {
         var options = new OptionsDescription(this);
@@ -1760,7 +1906,7 @@ public class AdvancedOptions: IReadOnlyAdvancedOptions
     ///     written
     /// </summary>
     [IgnoreDescription]
-    public PostgresqlMigrator Migrator { get; } = new();
+    public PostgresqlMigrator Migrator { get; } = new MartenMigrator();
 
     /// <summary>
     /// Configuration options when using a <see cref="NpgsqlMultiHostDataSource"/>

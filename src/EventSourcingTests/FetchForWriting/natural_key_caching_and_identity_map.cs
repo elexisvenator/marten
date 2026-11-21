@@ -47,10 +47,14 @@ public class natural_key_caching_and_identity_map: OneOffConfigurationsContext
         var number = new OrderNumber("CACHE-ASYNC");
         var streamId = await startOrder(number);
 
-        // The Async plan stores the aggregate in the cache straight away, and points its keys at it
+        // The commit writes the aggregate back to the cache at the version it was fetched at, and points its
+        // keys at it
         await using (var first = theStore.LightweightSession())
         {
-            (await first.Events.FetchForWriting<OrderSummary, OrderNumber>(number)).Aggregate!.Items.ShouldBe(1);
+            var fetched = await first.Events.FetchForWriting<OrderSummary, OrderNumber>(number);
+            fetched.Aggregate!.Items.ShouldBe(1);
+            fetched.AppendOne(new OrderItemAdded("Gizmo", 1m));
+            await first.SaveChangesAsync();
         }
 
         theSession.Events.Append(streamId, new OrderItemAdded("Gadget", 5m));
@@ -62,10 +66,10 @@ public class natural_key_caching_and_identity_map: OneOffConfigurationsContext
 
         theCache.Hits.ShouldBe(hits + 1);
         stream.Id.ShouldBe(streamId);
-        stream.CurrentVersion.ShouldBe(3);
+        stream.CurrentVersion.ShouldBe(4);
 
-        // The cached baseline, plus the event appended since it was cached
-        stream.Aggregate!.Items.ShouldBe(2);
+        // The cached baseline, plus the two events appended since it was fetched
+        stream.Aggregate!.Items.ShouldBe(3);
     }
 
     [Fact]

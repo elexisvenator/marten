@@ -5,6 +5,7 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using JasperFx;
+using JasperFx.Core;
 using JasperFx.Core.Reflection;
 using JasperFx.Events;
 using JasperFx.Events.Aggregation;
@@ -81,10 +82,15 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
     protected virtual bool UsesWriteCache => false;
 
     /// <summary>
-    /// A snapshot taken from the aggregate write cache through <see cref="NaturalKeyStreamIndex"/>, for the
-    /// stream the natural key pointed at when the fetch began.
+    /// A snapshot claimed from the aggregate write cache through <see cref="NaturalKeyStreamIndex"/>, for the
+    /// stream the natural key pointed at when the fetch began. Claimed through the session's
+    /// <see cref="AggregateWriteCacheSession"/>, as the stream-id plans claim theirs.
     /// </summary>
-    protected sealed record CachedSnapshot(AggregateCacheKey Key, TId StreamId, TDoc Aggregate, long Version);
+    protected sealed record CachedSnapshot(AggregateCacheKey Key, TId StreamId, AggregateWriteBaseline<TDoc> Baseline)
+    {
+        public TDoc Aggregate => Baseline.Aggregate!;
+        public long Version => Baseline.Version;
+    }
 
     /// <summary>
     /// The statements after the version row, each starting with <c>builder.StartNewCommand()</c> and finding
@@ -124,11 +130,11 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
     protected virtual bool cachedSnapshotFits(long cachedVersion, long streamVersion) => false;
 
     /// <summary>
-    /// After a FetchForWriting that may use the cache, hands the aggregate to it: the Inline plan after the
-    /// commit, the Async plan straight away. As for the stream-id plans.
+    /// Called once the fetched aggregate is owed back to the write cache, for a lifecycle whose commit moves the
+    /// aggregate on. The Inline plan hands the write-back the instance its projection stores, as
+    /// <see cref="FetchInlinedPlan{TDoc,TId}"/> does.
     /// </summary>
-    protected virtual void offerToCache(DocumentSessionBase session, IAggregateWriteCache cache,
-        AggregateCacheKey key, TDoc aggregate, TId streamId, long version)
+    protected virtual void onOwedToCache(DocumentSessionBase session, AggregateCacheKey key, TId streamId)
     {
     }
 
@@ -335,9 +341,8 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
         }
 
         var key = cacheKeyFor(session, streamId);
-        return _cache.TryTake(key, out var aggregate, out var version)
-            ? new CachedSnapshot(key, streamId, (TDoc)aggregate, version)
-            : null;
+        var baseline = session.AggregateWriteCache.TakeBaseline<TDoc>(_cache, key);
+        return baseline.HasAggregate ? new CachedSnapshot(key, streamId, baseline) : null;
     }
 
     private async Task<IEventStream<TDoc>> readStreamAsync(DbDataReader reader, DocumentSessionBase session,
@@ -353,9 +358,18 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
         // owns the key sees the first event that sets it.
         if (!found) return identity.StartStream<TDoc>(null, session, newStreamId(), cancellation);
 
+        // jasperfx#1050: owed to the cache at the version the aggregate reflects, and written back only after a
+        // commit this session owns. Without a cached snapshot for this very stream, the claim is made now, which
+        // also clears an entry the stream has moved past.
         if (_cache != null && aggregate != null)
         {
-            offerToCache(session, _cache, cacheKeyFor(session, streamId), aggregate, streamId, version);
+            var key = cacheKeyFor(session, streamId);
+            var baseline = cached != null && cached.Key.Equals(key)
+                ? cached.Baseline
+                : session.AggregateWriteCache.TakeBaseline<TDoc>(_cache, key, version);
+
+            session.AggregateWriteCache.Register(baseline, aggregate, version);
+            onOwedToCache(session, key, streamId);
         }
 
         var stream = version == 0
@@ -389,8 +403,8 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
     private static TId newStreamId()
     {
         return typeof(TId) == typeof(Guid)
-            ? (TId)(object)Guid.NewGuid()
-            : (TId)(object)Guid.NewGuid().ToString();
+            ? (TId)(object)SequentialGuid.NextPostgresOrder()
+            : (TId)(object)SequentialGuid.NextPostgresOrder().ToString();
     }
 
     /// <summary>
@@ -499,7 +513,8 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
 
         if (cached != null)
         {
-            await assertCachedSnapshotIsUsableAsync(reader, found, streamId, version, keyValue!, cached, cancellation)
+            await assertCachedSnapshotIsUsableAsync(reader, session, found, streamId, version, keyValue!, cached,
+                    cancellation)
                 .ConfigureAwait(false);
         }
 
@@ -537,21 +552,22 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
     /// The database, not the pointer, says which stream has the key. Only checked on the standalone path,
     /// where the reader belongs to this fetch alone and can be drained before the redo.
     /// </summary>
-    private async Task assertCachedSnapshotIsUsableAsync(DbDataReader reader, bool found, TId streamId,
-        long version, object keyValue, CachedSnapshot cached, CancellationToken cancellation)
+    private async Task assertCachedSnapshotIsUsableAsync(DbDataReader reader, DocumentSessionBase session,
+        bool found, TId streamId, long version, object keyValue, CachedSnapshot cached,
+        CancellationToken cancellation)
     {
         if (found && EqualityComparer<TId>.Default.Equals(streamId, cached.StreamId))
         {
             if (cachedSnapshotFits(cached.Version, version)) return;
 
-            // Wrong for its own stream, so it is not put back. TryTake has already removed it.
+            // Wrong for its own stream, so it is not owed back. The claim has already removed it.
             await drainAsync(reader, cancellation).ConfigureAwait(false);
             throw new CachedSnapshotUnusableException();
         }
 
-        // The key has moved, or gone. The snapshot is still right for its own stream, so it goes back, and the
-        // stale pointer is dropped.
-        _cache!.Store(cached.Key, cached.Aggregate, cached.Version);
+        // The key has moved, or gone. The snapshot is still right for its own stream and was never handed to anyone,
+        // so it goes straight back, unless a newer one has been stored meanwhile, and the stale pointer is dropped.
+        _cache!.StoreIfNewer(cached.Key, cached.Aggregate, cached.Version);
         _events.NaturalKeyStreams.Forget(_naturalKey, cached.Key, keyValue);
 
         await drainAsync(reader, cancellation).ConfigureAwait(false);
@@ -600,7 +616,7 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
         return new LatestHandler(this, id);
     }
 
-    private sealed class StreamHandler: IQueryHandler<IEventStream<TDoc>>
+    private sealed class StreamHandler: IQueryHandler<IEventStream<TDoc>>, IExclusiveFetchHandler
     {
         private readonly FetchNaturalKeyPlan<TDoc, TNaturalKey, TId> _parent;
         private readonly TNaturalKey _id;
@@ -615,6 +631,9 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
             _forUpdate = forUpdate;
             _expectedVersion = expectedVersion;
         }
+
+        // The version read that takes the lock is the first statement writeFetch writes
+        public object? ExclusiveStreamId => _forUpdate ? _id : null;
 
         public void ConfigureCommand(ICommandBuilder builder, IStorageSession session)
         {

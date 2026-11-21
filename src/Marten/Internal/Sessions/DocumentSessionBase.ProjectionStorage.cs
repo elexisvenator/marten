@@ -18,8 +18,6 @@ using System.Diagnostics.CodeAnalysis;
 
 namespace Marten.Internal.Sessions;
 
-[UnconditionalSuppressMessage("Trimming", "IL2026",
-    Justification = "Class-level: consumes RUC-annotated members (ISerializer, JasperFx.Events aggregator graph, CloseAndBuildAs / GenericFactoryCache fallbacks, FastExpressionCompiler). Document/event/projection types flow in from StoreOptions / Schema.For<T>() / projection registration and are preserved per the AOT publishing guide; AOT consumers supply a source-generator-backed serializer + pre-generated codegen artifacts.")]
 [UnconditionalSuppressMessage("Trimming", "IL2087",
     Justification = "Class-level: generic method/type argument flows reflective Type values into a DAM-annotated target. Source preserved at the registration boundary.")]
 public abstract partial class DocumentSessionBase
@@ -44,8 +42,6 @@ public abstract partial class DocumentSessionBase
     }
 }
 
-[UnconditionalSuppressMessage("Trimming", "IL2026",
-    Justification = "Class-level: consumes RUC-annotated members (ISerializer, JasperFx.Events aggregator graph, CloseAndBuildAs / GenericFactoryCache fallbacks, FastExpressionCompiler). Document/event/projection types flow in from StoreOptions / Schema.For<T>() / projection registration and are preserved per the AOT publishing guide; AOT consumers supply a source-generator-backed serializer + pre-generated codegen artifacts.")]
 [UnconditionalSuppressMessage("Trimming", "IL2087",
     Justification = "Class-level: generic method/type argument flows reflective Type values into a DAM-annotated target. Source preserved at the registration boundary.")]
 internal class ProjectionStorage<TDoc, TId>: IProjectionStorage<TDoc, TId> where TId : notnull where TDoc : notnull
@@ -93,6 +89,18 @@ internal class ProjectionStorage<TDoc, TId>: IProjectionStorage<TDoc, TId> where
     public void Delete(TId identity)
     {
         var deletion = _storage.DeleteForId(identity, TenantId);
+        _session.QueueOperation(deletion);
+    }
+
+    /// <summary>
+    ///     Remove the document with this identity outright, soft-deleted or not, as part of the batch (marten#6071,
+    ///     jasperfx#1201). A per-identity rebuild clears the identity this way before it writes the re-fold, so a
+    ///     stream that folds to nothing leaves no document and a soft-deleted row does not survive a fold that
+    ///     recreates it.
+    /// </summary>
+    public void HardDeleteById(TId identity)
+    {
+        var deletion = _storage.HardDeleteForId(identity, TenantId);
         _session.QueueOperation(deletion);
     }
 
@@ -148,6 +156,15 @@ internal class ProjectionStorage<TDoc, TId>: IProjectionStorage<TDoc, TId> where
             // Put it in the identity map -- if necessary
             _storage.Store(_session, snapshot);
         }
+        else if (_session.TrackingMode != DocumentTracking.None)
+        {
+            // #6106: an identity-map or dirty-tracked session can still hold this aggregate from before the
+            // commit, because FetchForWriting loads it through the session's own storage. Left there, every
+            // later read in this session answers the snapshot this projection just replaced, so eject it and
+            // let the next read go to the database. The daemon's sessions never track documents, so this
+            // doesn't touch session state from its parallel workers (#4667).
+            _storage.Eject(_session, snapshot);
+        }
 
         var upsert = _storage.UpsertProjected(snapshot, tenantId);
         _session.QueueOperation(upsert);
@@ -201,7 +218,21 @@ internal class ProjectionStorage<TDoc, TId>: IProjectionStorage<TDoc, TId> where
             // revision is the global sequence, which passes int.MaxValue on a large store -- the case #4526 puts
             // on ILongVersioned and a bigint column. Narrowing an IRevisioned (int) member happens where the
             // value is written back to the document, not here.
-            r.Revision = scope == AggregationScope.SingleStream ? lastEvent.Version : lastEvent.Sequence;
+            //
+            // #6036: lastEvent is null when the slice held nothing after a Compacted<T>: the runner fast-forwards
+            // over the snapshot and keeps only the events behind it. The snapshot's own mapped revision, when it
+            // has one, is the version the compaction folded through. Otherwise the revision is left at 0, and the
+            // single stream document is written at its stream's version, as Bug_6036 checks for both a new and an
+            // existing document.
+            if (lastEvent != null)
+            {
+                r.Revision = scope == AggregationScope.SingleStream ? lastEvent.Version : lastEvent.Sequence;
+            }
+            else if (_storage.MappedRevisionFor(aggregate) is { } mapped && mapped > 0)
+            {
+                r.Revision = mapped;
+            }
+
             r.IgnoreConcurrencyViolation = true;
         }
 
@@ -222,6 +253,8 @@ internal class ProjectionStorage<TDoc, TId>: IProjectionStorage<TDoc, TId> where
 
     // #4968: resolve the raw stream id (Guid/string) from TId, unwrapping a strong-typed id. The archive
     // operation itself is now built through the dialect's seam factory, so this only handles id extraction.
+    [UnconditionalSuppressMessage("Trimming", "IL2026",
+        Justification = "Consumes RUC-annotated members (ISerializer, JasperFx.Events aggregator graph, CloseAndBuildAs / GenericFactoryCache fallbacks, FastExpressionCompiler). Document/event/projection types flow in from StoreOptions / Schema.For<T>() / projection registration and are preserved per the AOT publishing guide; AOT consumers supply a source-generator-backed serializer + pre-generated codegen artifacts.")]
     private Func<TId, object> streamIdUnwrapperFor<TId>()
     {
         if (_archiveStreamIdUnwrappers.TryFind(typeof(TId), out var raw))

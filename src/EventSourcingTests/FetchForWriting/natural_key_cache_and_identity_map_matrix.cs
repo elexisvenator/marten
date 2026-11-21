@@ -41,10 +41,11 @@ public enum ByWhat
 
 /// <summary>
 /// The write cache and the identity map answer a fetch whichever way the aggregate was first fetched, by stream
-/// id or by natural key, and whichever way it is fetched again. Batches behave as they do by stream id: a
-/// batched fetch for writing does not take from the write cache, a batched fetch for writing by stream id does
-/// not write back to it, and a batched FetchLatest of an Async or Live aggregate does not fold the session's
-/// pending events.
+/// id or by natural key, and whichever way it is fetched again. Every fetch for writing, batched or not, claims
+/// the stream's write cache entry and writes the aggregate back after its commit. A batched fetch by natural key
+/// claims the entry once the batch has said which stream the key names, and reads that stream uncached, because a
+/// batch cannot redo one fetch after a stale pointer. A batched FetchLatest of an Async or Live aggregate does not
+/// fold the session's pending events, as by stream id.
 /// </summary>
 public class natural_key_cache_and_identity_map_matrix: OneOffConfigurationsContext
 {
@@ -134,13 +135,12 @@ public class natural_key_cache_and_identity_map_matrix: OneOffConfigurationsCont
         }
 
         var hits = theCache.Hits;
-        var hit = take is ByWhat.StreamId or ByWhat.NaturalKey && seed != ByWhat.BatchedStreamId;
 
         await using (var taking = theStore.LightweightSession())
         {
             var stream = await fetchForWritingAsync(taking, take, streamId);
 
-            theCache.Hits.ShouldBe(hit ? hits + 1 : hits);
+            theCache.Hits.ShouldBe(hits + 1);
             stream.Aggregate!.BCount.ShouldBe(2);
             stream.CurrentVersion.ShouldBe(4);
 

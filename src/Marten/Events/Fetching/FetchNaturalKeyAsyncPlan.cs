@@ -61,17 +61,6 @@ internal class FetchNaturalKeyAsyncPlan<TDoc, TNaturalKey, TId>: FetchNaturalKey
     protected override bool cachedSnapshotFits(long cachedVersion, long streamVersion) =>
         cachedVersion <= streamVersion;
 
-    // As FetchAsyncPlan: the aggregate is now at the stream version, which is durable whatever the caller does
-    // next, because events it appends are not applied to this instance under the Async lifecycle
-    protected override void offerToCache(DocumentSessionBase session, IAggregateWriteCache cache,
-        AggregateCacheKey key, TDoc aggregate, TId streamId, long version)
-    {
-        if (version <= 0) return;
-
-        cache.Store(key, aggregate, version);
-        _events.NaturalKeyStreams.Register(key, aggregate);
-    }
-
     // As FetchAsyncPlan.FetchForReading: a stream fetched for writing earlier in the session, plus whatever has
     // been appended to it since
     protected override async ValueTask<(bool found, TDoc? aggregate)> tryFetchFromIdentityMapAsync(

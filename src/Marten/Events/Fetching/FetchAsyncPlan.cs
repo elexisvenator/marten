@@ -20,10 +20,6 @@ using JasperFx.Events.Fetching;
 
 namespace Marten.Events.Fetching;
 
-[UnconditionalSuppressMessage("Trimming", "IL2026",
-    Justification = "Class-level: consumes RUC-annotated members (ISerializer, JasperFx.Events aggregator graph, CloseAndBuildAs / GenericFactoryCache fallbacks, FastExpressionCompiler). Document/event/projection types flow in from StoreOptions / Schema.For<T>() / projection registration and are preserved per the AOT publishing guide; AOT consumers supply a source-generator-backed serializer + pre-generated codegen artifacts.")]
-[UnconditionalSuppressMessage("AOT", "IL3050",
-    Justification = "Class-level: uses Type.MakeGenericType / MethodInfo.MakeGenericMethod / Activator.CreateInstance / FastExpressionCompiler — runtime code generation. AOT consumers pre-generate codegen artifacts (codegen write) and supply source-generator-backed serializer impls per the AOT publishing guide.")]
 internal partial class FetchAsyncPlan<TDoc, TId>: IAggregateFetchPlan<TDoc, TId> where TDoc : class where TId : notnull
 {
     private readonly IAggregator<TDoc, TId, IQuerySession> _aggregator;
@@ -37,6 +33,10 @@ internal partial class FetchAsyncPlan<TDoc, TId>: IAggregateFetchPlan<TDoc, TId>
     private string? _selectedEventFields;
     private int _eventFieldCount;
 
+    [UnconditionalSuppressMessage("AOT", "IL3050",
+        Justification = "Uses Type.MakeGenericType / MethodInfo.MakeGenericMethod / Activator.CreateInstance / FastExpressionCompiler — runtime code generation. AOT consumers supply source-generator-backed serializer impls per the AOT publishing guide.")]
+    [UnconditionalSuppressMessage("Trimming", "IL2026",
+        Justification = "Consumes RUC-annotated members (ISerializer, JasperFx.Events aggregator graph, CloseAndBuildAs / GenericFactoryCache fallbacks, FastExpressionCompiler). Document/event/projection types flow in from StoreOptions / Schema.For<T>() / projection registration and are preserved per the AOT publishing guide; AOT consumers supply a source-generator-backed serializer + pre-generated codegen artifacts.")]
     public FetchAsyncPlan(EventGraph events, IEventIdentityStrategy<TId> identityStrategy,
         IDocumentStorage<TDoc, TId> storage)
     {
@@ -138,17 +138,27 @@ internal partial class FetchAsyncPlan<TDoc, TId>: IAggregateFetchPlan<TDoc, TId>
     ///     What <see cref="writeEventFetchStatement" /> read: the events after the cut-off, the cut-off, and whether
     ///     the stream exists.
     /// </summary>
-    internal readonly record struct Delta(IReadOnlyList<IEvent> Events, long Floor, bool StreamExists);
+    /// <param name="CacheHit">
+    ///     #6086: the floor is the cached aggregate's version, which the cached batch statement
+    ///     (<see cref="writeCachedReads" />) chose over the snapshot's.
+    /// </param>
+    internal readonly record struct Delta(IReadOnlyList<IEvent> Events, long Floor, bool StreamExists, bool CacheHit = false);
 
-    private async Task<Delta> readDeltaAsync(DbDataReader reader, IEventStorage selector, CancellationToken token)
+    private async Task<Delta> readDeltaAsync(DbDataReader reader, IEventStorage selector, CancellationToken token,
+        bool readsCacheHit = false)
     {
         var events = new List<IEvent>();
         long floor = 0;
         var streamExists = false;
+        var cacheHit = false;
         while (await reader.ReadAsync(token).ConfigureAwait(false))
         {
             floor = await reader.GetFieldValueAsync<long>(_eventFieldCount, token).ConfigureAwait(false);
             streamExists = await reader.GetFieldValueAsync<bool>(_eventFieldCount + 1, token).ConfigureAwait(false);
+            if (readsCacheHit)
+            {
+                cacheHit = await reader.GetFieldValueAsync<bool>(_eventFieldCount + 2, token).ConfigureAwait(false);
+            }
 
             // An empty delta still returns its floor, on one row with no event in it
             if (await reader.IsDBNullAsync(0, token).ConfigureAwait(false)) continue;
@@ -156,7 +166,7 @@ internal partial class FetchAsyncPlan<TDoc, TId>: IAggregateFetchPlan<TDoc, TId>
             events.Add(await ((ISelector<IEvent>)selector).ResolveAsync(reader, token).ConfigureAwait(false));
         }
 
-        return new Delta(events, floor, streamExists);
+        return new Delta(events, floor, streamExists, cacheHit);
     }
 
     /// <summary>

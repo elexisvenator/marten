@@ -12,15 +12,11 @@ namespace DaemonTests.Bugs;
 
 public class Bug_catching_up_apply_errors: OneOffConfigurationsContext
 {
-    // Retry is opt-in under the supervisor (JasperFx/bobcat#565), and this test earned it with
-    // evidence: in 33 green master runs (2026-09 to 2026-10-15) its first attempt failed in 13 —
-    // "Task should throw System.AggregateException but did not" — and passed on a fresh-process
-    // retry every time. It is still reported as FLAKY in the retry ledger and the job summary;
-    // the trait keeps a known intermittent from turning the job red, it does not hide it. The
-    // projection throws deterministically, so a CatchUpAsync that returns cleanly is worth an
-    // investigation of its own (state left by an earlier test in the same process is the lead).
+    // marten#5696: this failed its first attempt in 13 of 33 green master runs ("Task should throw
+    // System.AggregateException but did not"). CatchUpAsync checked its Recorder before the shard state
+    // tracker's asynchronous block had delivered the failure. JasperFx fixed that in jasperfx#1134 (2.100.1
+    // and 3.x) by reading the faulted shard's failure from the agent, so the Retry trait is gone.
     [Fact]
-    [Trait("Retry", "3")]
     public async Task should_catch_apply_event_exceptions()
     {
         StoreOptions(opts =>
@@ -50,14 +46,8 @@ public class Bug_catching_up_apply_errors: OneOffConfigurationsContext
 
 public class Bug_catching_up_command_errors: OneOffConfigurationsContext
 {
-    // The same intermittent as should_catch_apply_event_exceptions above, with the same shape and the
-    // same failure ("Task should throw System.AggregateException but did not"), but without the trait,
-    // so one miss turned a whole job red: PR 5780's Daemon (net10, PGlatest, STJ) job on 2026-10-28,
-    // for a change that cannot reach this test. Retry is opt-in under the supervisor (JasperFx/bobcat#565);
-    // a pass on a retry is still reported as FLAKY in the retry ledger and the job summary. The lead is
-    // the one above: CatchUpAsync can return before a faulted shard's exception is observable.
+    // Same race and same fix as should_catch_apply_event_exceptions above (marten#5696, jasperfx#1134)
     [Fact]
-    [Trait("Retry", "3")]
     public async Task should_catch_marten_command_exceptions()
     {
         StoreOptions(opts =>

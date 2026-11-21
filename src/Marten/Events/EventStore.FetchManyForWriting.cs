@@ -33,7 +33,7 @@ internal partial class EventStore
     public Task<IReadOnlyList<IEventStream<T>>> FetchManyForWriting<T>(IReadOnlyList<Guid> ids,
         CancellationToken cancellation = default) where T : class
         => fetchManyForWritingAsync<T, Guid>(ids, nameof(ids), (batch, id) => batch.Events.FetchForWriting<T>(id),
-            id => FetchForWriting<T>(id, cancellation), cancellation);
+            id => Operations.FetchForWriting<T>(id, cancellation), cancellation);
 
     /// <inheritdoc cref="FetchManyForWriting{T}(IReadOnlyList{Guid}, CancellationToken)" />
     /// <exception cref="ArgumentException">When <paramref name="keys" /> repeats a key.</exception>
@@ -41,7 +41,7 @@ internal partial class EventStore
         CancellationToken cancellation = default) where T : class
         => fetchManyForWritingAsync<T, string>(keys, nameof(keys),
             (batch, key) => batch.Events.FetchForWriting<T>(key),
-            key => FetchForWriting<T>(key, cancellation), cancellation);
+            key => Operations.FetchForWriting<T>(key, cancellation), cancellation);
 
     /// <summary>
     ///     The many-stream form of <see cref="FetchForWriting{T, TId}(TId, CancellationToken)" />: by a natural
@@ -99,6 +99,9 @@ internal partial class EventStore
 
         var batch = _session.CreateBatchQuery();
 
+        // Each fetch in the batch starts or appends to its stream in this session as it is read (#6073)
+        var streamActionsBefore = _session.WorkTracker.Streams.Count;
+
         // Enlisting is synchronous and hands back an unawaited Task per stream; nothing is executed
         // until Execute, which is what makes this one round trip instead of identities.Count.
         var pending = new Task<IEventStream<T>>[identities.Count];
@@ -115,8 +118,11 @@ internal partial class EventStore
         {
             // An Async snapshot went backwards mid-batch, as it does while a projection is rebuilt, or a natural
             // key changed hands while it was read. A batch cannot redo one fetch, but the single-stream fetch
-            // can, so fall back to one per stream.
-            // Nothing was handed out yet, so the abandoned batch items are never observed.
+            // can, so fall back to one per stream. Nothing was handed out yet, so the abandoned batch items are never observed -- but the fetches
+            // read before the refused one already added their stream actions to the session. Take those back,
+            // or a new stream would be started twice: once by the batch and again by the fallback (#6073).
+            discardStreamActionsSince(streamActionsBefore);
+
             var sequential = new IEventStream<T>[identities.Count];
             for (var i = 0; i < identities.Count; i++)
             {
@@ -133,6 +139,19 @@ internal partial class EventStore
         }
 
         return streams;
+    }
+
+    /// <summary>
+    ///     Removes the stream actions an abandoned batch added. Executing the batch only ever adds to the
+    ///     session's streams, so everything past the count taken before it ran belongs to the batch.
+    /// </summary>
+    private void discardStreamActionsSince(int count)
+    {
+        var streams = _session.WorkTracker.Streams;
+        if (streams.Count > count)
+        {
+            streams.RemoveRange(count, streams.Count - count);
+        }
     }
 
     /// <summary>

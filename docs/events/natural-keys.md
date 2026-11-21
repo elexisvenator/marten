@@ -477,14 +477,14 @@ The JasperFx source generator reports natural key mistakes as compiler errors, a
 
 | Id | Rule |
 | --- | --- |
-| `JFXEVT008` | An aggregate owns more than one natural key |
-| `JFXEVT009` | Two natural keys on one aggregate share a type (`TKey` and `TKey?` count as the same) |
-| `JFXEVT010` | A mapped key names its own aggregate or projection as its source |
-| `JFXEVT011` | A mapped key's source is not an aggregate projection, or owns no natural key |
-| `JFXEVT012` | A mapped key's source key is itself mapped |
-| `JFXEVT013` | A mapped key's type does not match the type of the key its source owns |
-| `JFXEVT014` | Wolverine's `[WriteAggregate<TKey>]`, `[ReadAggregate<TKey>]`, `[WriteModel<TKey>]` or `[ReadModel<TKey>]` (or `NaturalKey = typeof(TKey)`) names a key type the aggregate doesn't have |
-| `JFXEVT015` | One of those attributes names `TKey?` instead of `TKey` |
+| `JFXEVT010` | An aggregate owns more than one natural key |
+| `JFXEVT011` | Two natural keys on one aggregate share a type (`TKey` and `TKey?` count as the same) |
+| `JFXEVT012` | A mapped key names its own aggregate or projection as its source |
+| `JFXEVT013` | A mapped key's source is not an aggregate projection, or owns no natural key |
+| `JFXEVT014` | A mapped key's source key is itself mapped |
+| `JFXEVT015` | A mapped key's type does not match the type of the key its source owns |
+| `JFXEVT016` | Wolverine's `[WriteAggregate<TKey>]`, `[ReadAggregate<TKey>]`, `[WriteModel<TKey>]` or `[ReadModel<TKey>]` (or `NaturalKey = typeof(TKey)`) names a key type the aggregate doesn't have |
+| `JFXEVT017` | One of those attributes names `TKey?` instead of `TKey` |
 
 ## Integration with Wolverine
 

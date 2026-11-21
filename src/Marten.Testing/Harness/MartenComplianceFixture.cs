@@ -68,6 +68,12 @@ public class MartenComplianceFixture: EventStoreComplianceFixture<IDocumentOpera
     public override bool SupportsAllTenantStreamStates => true;
 
     /// <summary>
+    /// jasperfx#1150. <c>MartenDatabase.FetchFirstEventTimestampsAfterAsync</c> answers every position in one
+    /// batched round trip, each an <c>order by seq_id limit 1</c> seek over <c>mt_events</c>.
+    /// </summary>
+    public override bool SupportsPendingEventAges => true;
+
+    /// <summary>
     /// #5383 part 5 — the database a tenant's data lives in, through Marten's own tenancy rather than
     /// a test-local map, so the suite exercises the resolution the product ships.
     /// </summary>
@@ -114,24 +120,13 @@ public class MartenComplianceFixture: EventStoreComplianceFixture<IDocumentOpera
             options.Events.StreamIdentity = config.StreamIdentity.Value;
         }
 
-        if (config.EnableCorrelationTracking)
-        {
-            options.Events.MetadataConfig.CorrelationIdEnabled = true;
-            options.Events.MetadataConfig.CausationIdEnabled = true;
-        }
-
-        // Opt-in exactly like correlation tracking above -- the user_name column is only
-        // captured (and only queryable) when the store enables it. Added for the jasperfx#737
-        // EventQueryCompliance suite's user-name filter facts.
-        if (config.EnableUserNameTracking)
-        {
-            options.Events.MetadataConfig.UserNameEnabled = true;
-        }
-
-        if (config.EnableHeaders)
-        {
-            options.Events.MetadataConfig.HeadersEnabled = true;
-        }
+        // Each flag is replayed both ways: all event metadata is on by default since Marten 10 (#5812), and
+        // the suites describe a store that captures only what the config asks for. The user_name column is
+        // what the jasperfx#737 EventQueryCompliance suite's user-name filter facts need.
+        options.Events.MetadataConfig.CorrelationIdEnabled = config.EnableCorrelationTracking;
+        options.Events.MetadataConfig.CausationIdEnabled = config.EnableCorrelationTracking;
+        options.Events.MetadataConfig.UserNameEnabled = config.EnableUserNameTracking;
+        options.Events.MetadataConfig.HeadersEnabled = config.EnableHeaders;
 
         if (config.ConjoinedEventTenancy)
         {
@@ -167,6 +162,14 @@ public class MartenComplianceFixture: EventStoreComplianceFixture<IDocumentOpera
         foreach (var listener in config.CommitListeners)
         {
             options.Listeners.Add(new DocumentCommitListenerAdapter(listener));
+        }
+
+        // #5887: the DCB append condition facts race saves against each other, and a retried
+        // deadlock (40P01) commits about a second later -- with the default write retry on, those
+        // facts cannot tell a save that queued for a lock from one that deadlocked.
+        if (config.DisableWriteRetries)
+        {
+            options.ConfigureWritePolly(_ => { });
         }
 
         config.ApplyTo(new MartenComplianceRegistrar(options));
@@ -207,7 +210,8 @@ public class MartenComplianceFixture: EventStoreComplianceFixture<IDocumentOpera
         _shardAssignments.Clear();
 
         var connectionStrings = new Dictionary<string, string>();
-        await using (var conn = new NpgsqlConnection(ConnectionSource.ConnectionString))
+        // #6023: creating a database takes longer than the short test timeout on a busy server
+        await using (var conn = new NpgsqlConnection(ConnectionSource.AdminConnectionString))
         {
             await conn.OpenAsync().ConfigureAwait(false);
             foreach (var databaseName in _tenantDatabases.Values.Distinct())
@@ -217,7 +221,7 @@ public class MartenComplianceFixture: EventStoreComplianceFixture<IDocumentOpera
                     await new DatabaseSpecification().BuildDatabase(conn, databaseName).ConfigureAwait(false);
                 }
 
-                connectionStrings[databaseName] = new NpgsqlConnectionStringBuilder(ConnectionSource.ConnectionString)
+                connectionStrings[databaseName] = new NpgsqlConnectionStringBuilder(ConnectionSource.ComplianceConnectionString)
                 {
                     Database = databaseName
                 }.ConnectionString;
@@ -231,7 +235,7 @@ public class MartenComplianceFixture: EventStoreComplianceFixture<IDocumentOpera
             // conjoined or the tenants in one shard cannot be told apart at all.
             options.MultiTenantedWithShardedDatabases(x =>
             {
-                x.ConnectionString = ConnectionSource.ConnectionString;
+                x.ConnectionString = ConnectionSource.ComplianceConnectionString;
                 x.SchemaName = "compliance_shards";
                 foreach (var (databaseName, connectionString) in connectionStrings)
                 {
@@ -260,10 +264,10 @@ public class MartenComplianceFixture: EventStoreComplianceFixture<IDocumentOpera
     {
         if (!config.MaxPoolSize.HasValue)
         {
-            return ConnectionSource.ConnectionString;
+            return ConnectionSource.ComplianceConnectionString;
         }
 
-        return new NpgsqlConnectionStringBuilder(ConnectionSource.ConnectionString)
+        return new NpgsqlConnectionStringBuilder(ConnectionSource.ComplianceConnectionString)
         {
             MaxPoolSize = config.MaxPoolSize.Value
         }.ConnectionString;
@@ -271,22 +275,102 @@ public class MartenComplianceFixture: EventStoreComplianceFixture<IDocumentOpera
 
     public override IDocumentOperations OpenSession() => _store.LightweightSession();
 
+    /// <summary>
+    ///     Marten switches tenants on an open session through <c>IDocumentOperations.ForTenant</c>, which
+    ///     returns an <c>ITenantOperations</c> sharing the parent's unit of work. The session is not an
+    ///     <c>ITenantedQuerySession&lt;IDocumentOperations&gt;</c> (only the query side is), hence the override.
+    /// </summary>
+    public override bool SupportsSessionTenantSwitching => true;
+
+    public override IDocumentOperations ForTenant(IDocumentOperations session, string tenantId)
+        => session.ForTenant(tenantId);
+
+    /// <summary>
+    ///     Held open by a session on this fixture's own connection and transaction, via
+    ///     <c>SessionOptions.ForTransaction</c>, so the row is written by the store's own append SQL
+    ///     (the quick-append function, which allocates the sequence number) and committed only when the
+    ///     returned handle is disposed.
+    /// </summary>
+    public override bool SupportsHoldingAnAppendOpen => true;
+
+    public override async Task<IAsyncDisposable> HoldAppendOpenAsync(Guid streamId, object @event,
+        CancellationToken token)
+    {
+        var connection = _store.Storage.Database.CreateConnection();
+        try
+        {
+            await connection.OpenAsync(token).ConfigureAwait(false);
+            var transaction = await connection.BeginTransactionAsync(token).ConfigureAwait(false);
+            var session = _store.LightweightSession(SessionOptions.ForTransaction(transaction));
+
+            session.Events.StartStream(streamId, @event);
+            await session.SaveChangesAsync(token).ConfigureAwait(false);
+
+            return new HeldAppend(connection, transaction, session);
+        }
+        catch
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private sealed class HeldAppend(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        IDocumentSession session): IAsyncDisposable
+    {
+        public async ValueTask DisposeAsync()
+        {
+            await transaction.CommitAsync().ConfigureAwait(false);
+            await session.DisposeAsync().ConfigureAwait(false);
+            await transaction.DisposeAsync().ConfigureAwait(false);
+            await connection.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
     // No shared JasperFx interface declares SaveChangesAsync -- in Marten it lives on
     // IDocumentSession, which every session handed out by OpenSession() actually is.
     public override Task SaveChangesAsync(IDocumentOperations session, CancellationToken token)
         => ((IDocumentSession)session).SaveChangesAsync(token);
 
+    /// <summary>
+    ///     marten#6071: Marten's <c>LoadAsync</c> returns a soft-deleted document, so a load by id here does too, and
+    ///     the suites ask <see cref="IsSoftDeletedAsync{T}" /> whether it came back flagged deleted (jasperfx#1227,
+    ///     jasperfx#1232).
+    /// </summary>
+    public override bool LoadExcludesSoftDeletedDocuments => false;
+
     public override Task<T?> LoadDocumentAsync<T>(IQuerySession session, object id, CancellationToken token)
         where T : class
+        => loadAsync<T>(session, id, token);
+
+    private static Task<T?> loadAsync<T>(IQuerySession session, object id, CancellationToken token) where T : class
         => id switch
         {
             Guid guidId => session.LoadAsync<T>(guidId, token),
             int intId => session.LoadAsync<T>(intId, token),
             long longId => session.LoadAsync<T>(longId, token),
             string stringId => session.LoadAsync<T>(stringId, token),
+
+            // marten#6003: a strong-typed identifier, which Marten's object overload unwraps
+            _ when JasperFx.Core.Reflection.StrongTypedIdResolver.TryResolve(id.GetType(), out _,
+                    JasperFx.Core.Reflection.StrongTypedIdStyle.AnyType)
+                => session.LoadAsync<T>(id, token),
             _ => throw new ArgumentOutOfRangeException(nameof(id),
                 $"Marten cannot load documents by an identity of type {id.GetType().FullName}")
         };
+
+    /// <summary>
+    ///     jasperfx#1227: the document's own soft-delete metadata, <c>mt_deleted</c>.
+    /// </summary>
+    public override async Task<bool> IsSoftDeletedAsync<T>(IQuerySession session, object id, CancellationToken token)
+    {
+        var document = await loadAsync<T>(session, id, token).ConfigureAwait(false);
+        if (document == null) return false;
+
+        return (await session.MetadataForAsync(document, token).ConfigureAwait(false))?.Deleted == true;
+    }
 
     public override void StoreDocument<T>(IDocumentOperations session, T document) => session.Store(document);
 
@@ -600,6 +684,18 @@ public class MartenComplianceFixture: EventStoreComplianceFixture<IDocumentOpera
     public override bool SupportsProjectionFloors => true;
 
     /// <summary>
+    ///     jasperfx#1215 / #1222. <c>MartenDatabase</c> keeps the event-range marks in
+    ///     <c>mt_event_range_marks</c>, which, like the floors, no rebuild or data reset touches.
+    /// </summary>
+    public override bool SupportsEventRangeMarks => true;
+
+    /// <summary>
+    ///     jasperfx#1215. <c>IEventStore.RewriteStoredEventsAsync</c> runs Marten's stored-event rewriter with the
+    ///     page's cursor written in the page's own transaction, and the registrar forwards named transforms.
+    /// </summary>
+    public override bool SupportsEventRewrites => true;
+
+    /// <summary>
     ///     jasperfx#732. Marten's documented registration -- AddMarten(...).AddAsyncDaemon(...) --
     ///     is what has to be under test here, not a hand-built daemon, because the gap this suite
     ///     exists to close (fisher#138) was a store that produced no reachable IProjectionCoordinator
@@ -760,14 +856,12 @@ public class MartenComplianceFixture: EventStoreComplianceFixture<IDocumentOpera
     public override bool SupportsUpcasting => false;
 
     /// <summary>
-    ///     Left FALSE because the operation genuinely does not exist in Marten. ArchiveStream is on
-    ///     the shared IEventStoreOptions surface but its reverse is not: Polecat declares
-    ///     UnArchiveStream on its own IEventOperations and Marten has no equivalent at all (nothing
-    ///     in src/Marten matches "UnArchive"), which is why the shared fixture gates it rather than
-    ///     putting it on IEventStoreOperations. The unarchive facts of StreamArchivingCompliance skip;
-    ///     every archiving fact around them still runs.
+    ///     marten#5476: <c>IEventStoreOperations.UnArchiveStream</c> calls <c>mt_unarchive_stream</c>, the
+    ///     reverse of <c>mt_archive_stream</c>, so the unarchive facts of <c>StreamArchivingCompliance</c> run.
+    ///     Since JasperFx 3.3.0 (jasperfx#1186) the members are on the shared <c>IEventStoreOperations</c> and the
+    ///     suite calls them through <c>EventsFor(session)</c>, so the old fixture hook is no longer overridden.
     /// </summary>
-    public override bool SupportsUnarchiveStream => false;
+    public override bool SupportsUnarchiveStream => true;
 
     /// <summary>
     ///     marten#5673: IEventStoreOperations.TombstoneStream is implemented by DeleteStreamOperation,
@@ -776,46 +870,59 @@ public class MartenComplianceFixture: EventStoreComplianceFixture<IDocumentOpera
     public override bool SupportsTombstoneStream => true;
 
     /// <summary>
-    ///     Marten names its own six exceptions rather than the ones lifted into JasperFx.Events by
-    ///     jasperfx#751.
+    ///     marten#6071 (jasperfx#1201): the store reads one stream's events for a per-identity re-fold
+    ///     (<c>LoadEventsForIdentityRebuildAsync</c>), its projection storage hard deletes by id, and an empty
+    ///     range <c>(C, C]</c> records progression through the same floor-checked update as any other batch.
     /// </summary>
-    /// <remarks>
-    ///     <para>
-    ///         Not an oversight and not a gap. Marten enforces
-    ///         CoreTests.all_exceptions_should_derive_from_MartenException:
-    ///         every exception Marten throws must derive from MartenException, so that a caller can
-    ///         catch the whole family in one clause. C# has single inheritance, so a Marten type
-    ///         cannot derive from both MartenException and the lifted JasperFx type -- adopting the
-    ///         shared types by subclassing, the way Polecat and Fisher did, would break that
-    ///         convention. Marten therefore keeps all six in Marten.Exceptions and nominates them
-    ///         here. Revisiting the convention is deferred to Marten 10 (marten#5346).
-    ///     </para>
-    ///     <para>
-    ///         Fully qualified because JasperFx.Events is imported above and declares six types of
-    ///         exactly these names; the unqualified name would silently resolve to the wrong one and
-    ///         the assertion would fail with a type mismatch rather than a compile error.
-    ///     </para>
-    /// </remarks>
+    public override bool SupportsIdentityRebuild => true;
+
+    /// <summary>
+    ///     marten#6071: the registrar's <c>SoftDeleted&lt;TDoc&gt;()</c> is <c>Schema.For&lt;TDoc&gt;().SoftDeleted()</c>.
+    /// </summary>
+    public override bool SupportsSoftDeletedProjectionDocuments => true;
+
+    /// <summary>
+    ///     marten#6003: the parked table (<c>mt_parked_identities</c>) and its batch operations, the parked-identity
+    ///     reads on <c>MartenDatabase</c>, and every identity source a multi-stream projection can park through: stream,
+    ///     DCB tag, slice index and scan.
+    /// </summary>
+    public override bool SupportsParkedIdentities => true;
+
+    /// <summary>
+    ///     marten#6003: an event body is made unreadable by replacing its stored JSON with a string, which no event
+    ///     type deserializes from. The daemon's loader and the per-identity loader both read it through the event
+    ///     storage, which reports the row's stream and tenant with the failure.
+    /// </summary>
+    public override bool SupportsUnreadableEvents => true;
+
+    public override async Task MakeEventUnreadableAsync(long sequence)
+    {
+        await using var conn = _store.Storage.Database.CreateConnection();
+        await conn.OpenAsync().ConfigureAwait(false);
+        try
+        {
+            await using var command = conn.CreateCommand();
+            command.CommandText =
+                $"update {_store.Options.Events.DatabaseSchemaName}.mt_events set data = '\"unreadable\"'::jsonb where seq_id = :seq";
+            command.Parameters.AddWithValue("seq", sequence);
+            await command.ExecuteNonQueryAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            await conn.CloseAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    ///     marten#5847 (Marten 10): Marten throws the exception types lifted into JasperFx.Events
+    ///     directly, so the base nominations hold for every kind but one. DefaultTenantUsageDisabled is
+    ///     still Marten's own type.
+    /// </summary>
     public override Type ExceptionTypeFor(ComplianceExceptionKind kind) =>
         kind switch
         {
-            ComplianceExceptionKind.UnknownEventType => typeof(Marten.Exceptions.UnknownEventTypeException),
-            ComplianceExceptionKind.NonExistentStream => typeof(Marten.Exceptions.NonExistentStreamException),
-            ComplianceExceptionKind.ExistingStreamIdCollision =>
-                typeof(Marten.Exceptions.ExistingStreamIdCollisionException),
-            ComplianceExceptionKind.EventDeserializationFailure =>
-                typeof(Marten.Exceptions.EventDeserializationFailureException),
-            ComplianceExceptionKind.StreamLocked => typeof(Marten.Exceptions.StreamLockedException),
             ComplianceExceptionKind.DefaultTenantUsageDisabled =>
                 typeof(Marten.Exceptions.DefaultTenantUsageDisabledException),
-            // #5476 / jasperfx#871/#878 lifted a canonical ArchivedStreamException in
-            // JasperFx.Events 2.74.0. Marten still refuses an append to an archived stream with the
-            // generic InvalidStreamOperationException, from RichEventAppender and from the MT001
-            // translation in QuickAppendEventsOperationBase. Adopting the lifted type is BREAKING
-            // twice over -- it changes what an existing catch(InvalidStreamOperationException) sees,
-            // and a Marten subclass cannot also derive from MartenException -- so it is on the 10.0
-            // milestone with the rest of the reparenting, and this nominates what Marten throws today.
-            ComplianceExceptionKind.ArchivedStream => typeof(Marten.Exceptions.InvalidStreamOperationException),
             _ => base.ExceptionTypeFor(kind)
         };
 
@@ -847,6 +954,12 @@ public class MartenComplianceFixture: EventStoreComplianceFixture<IDocumentOpera
         }
 
         public void AddEventType(Type eventType) => _options.Events.AddEventType(eventType);
+
+        /// <summary>
+        ///     jasperfx#1215: named transforms live on the shared <c>EventRegistry</c>.
+        /// </summary>
+        public void AddRewriteTransform<TEvent>(string name, Func<TEvent, TEvent> transform) where TEvent : class
+            => _options.EventGraph.AddRewriteTransform(name, transform);
 
         /// <summary>
         ///     jasperfx#669: both binary-serialization members take the promoted
@@ -883,6 +996,12 @@ public class MartenComplianceFixture: EventStoreComplianceFixture<IDocumentOpera
 
         public void LiveAggregation<TDoc>() where TDoc : notnull
             => _options.Projections.LiveStreamAggregation<TDoc>();
+
+        /// <summary>
+        ///     jasperfx#1201 (marten#6071).
+        /// </summary>
+        public void SoftDeleted<TDoc>() where TDoc : notnull
+            => _options.Schema.For<TDoc>().SoftDeleted();
 
         /// <summary>
         ///     Marten needs a strong-typed identifier registered before it can use it in LINQ and identity

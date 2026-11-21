@@ -34,8 +34,10 @@ internal class AutoClosingLifetime: ConnectionLifetimeBase, IConnectionLifetime,
         // #5269: same resolution as every other lifetime -- this one builds its own rather than being handed
         // one by SessionOptions, and it is the lifetime the default (non-sticky) write path uses.
         CommandTimeout = _options.ResolveCommandTimeout(storeOptions);
+        // #5888: ReadFromPrimary keeps a read-only session off the standby, for readers like the async
+        // daemon's event loader whose results must agree with state read on the primary.
         _readerConnectionUsage =
-            options.Mode == CommandRunnerMode.ReadOnly
+            options.Mode == CommandRunnerMode.ReadOnly && !options.ReadFromPrimary
             ? ConnectionUsage.Read
             : ConnectionUsage.ReadWrite;
     }
@@ -52,39 +54,9 @@ internal class AutoClosingLifetime: ConnectionLifetimeBase, IConnectionLifetime,
 
     }
 
-    protected virtual void AfterOpened(NpgsqlConnection connection)
-    {
-    }
-
     protected virtual Task AfterOpenedAsync(NpgsqlConnection connection, CancellationToken token)
     {
         return Task.CompletedTask;
-    }
-
-    public int Execute(NpgsqlCommand cmd)
-    {
-        Logger.OnBeforeExecute(cmd);
-        using var conn = _database.CreateConnection();
-        conn.Open();
-        AfterOpened(conn);
-        try
-        {
-            cmd.Connection = conn;
-            cmd.CommandTimeout = CommandTimeout;
-            var returnValue = cmd.ExecuteNonQuery();
-
-            Logger.LogSuccess(cmd);
-            return returnValue;
-        }
-        catch (Exception e)
-        {
-            handleCommandException(cmd, e);
-            throw;
-        }
-        finally
-        {
-            conn.Close();
-        }
     }
 
     public async Task<int> ExecuteAsync(NpgsqlCommand command,
@@ -115,39 +87,12 @@ internal class AutoClosingLifetime: ConnectionLifetimeBase, IConnectionLifetime,
         }
     }
 
-    public DbDataReader ExecuteReader(NpgsqlCommand command)
-    {
-        Logger.OnBeforeExecute(command);
-
-        // Do NOT use a using block here because we're returning the reader
-        var conn = _database.CreateConnection(_readerConnectionUsage);
-        conn.Open();
-        AfterOpened(conn);
-
-        try
-        {
-            command.Connection = conn;
-            command.CommandTimeout = CommandTimeout;
-            var returnValue = command.ExecuteReader(CommandBehavior.CloseConnection);
-            Logger.LogSuccess(command);
-            return returnValue;
-        }
-        catch (Exception e)
-        {
-            conn.Close();
-            handleCommandException(command, e);
-            throw;
-        }
-    }
-
     public async Task<DbDataReader> ExecuteReaderAsync(NpgsqlCommand command, CancellationToken token = default)
     {
         Logger.OnBeforeExecute(command);
 
         // Do NOT use a using block here because we're returning the reader
-        var conn = _database.CreateConnection(_readerConnectionUsage);
-        await conn.OpenAsync(token).ConfigureAwait(false);
-        await AfterOpenedAsync(conn, token).ConfigureAwait(false);
+        var conn = await openConnectionAsync(_readerConnectionUsage, token).ConfigureAwait(false);
 
         try
         {
@@ -165,38 +110,12 @@ internal class AutoClosingLifetime: ConnectionLifetimeBase, IConnectionLifetime,
         }
     }
 
-    public DbDataReader ExecuteReader(NpgsqlBatch batch)
-    {
-        Logger.OnBeforeExecute(batch);
-
-        // Do NOT use a using block here because we're returning the reader
-        var conn = _database.CreateConnection(_readerConnectionUsage);
-        conn.Open();
-        AfterOpened(conn);
-
-        try
-        {
-            batch.Connection = conn;
-            batch.Timeout = CommandTimeout;
-            var reader = batch.ExecuteReader(CommandBehavior.CloseConnection);
-            Logger.LogSuccess(batch);
-            return reader;
-        }
-        catch (Exception)
-        {
-            conn.Close();
-            throw;
-        }
-    }
-
     public async Task<DbDataReader> ExecuteReaderAsync(NpgsqlBatch batch, CancellationToken token = default)
     {
         Logger.OnBeforeExecute(batch);
 
         // Do NOT use a using block here because we're returning the reader
-        var conn = _database.CreateConnection(_readerConnectionUsage);
-        await conn.OpenAsync(token).ConfigureAwait(false);
-        await AfterOpenedAsync(conn, token).ConfigureAwait(false);
+        var conn = await openConnectionAsync(_readerConnectionUsage, token).ConfigureAwait(false);
 
         try
         {
@@ -239,9 +158,27 @@ internal class AutoClosingLifetime: ConnectionLifetimeBase, IConnectionLifetime,
                     Logger.OnBeforeExecute(batch);
                     try
                     {
-                        await using var reader = await batch.ExecuteReaderAsync(token).ConfigureAwait(false);
-                        await page.ApplyCallbacksAsync(reader, exceptions, token).ConfigureAwait(false);
-                        await reader.CloseAsync().ConfigureAwait(false);
+                        DbDataReader reader;
+                        try
+                        {
+                            reader = await batch.ExecuteReaderAsync(token).ConfigureAwait(false);
+                        }
+                        catch (Exception e)
+                        {
+                            // #5914: only the operations whose statements the reader executed translate this
+                            if (page.TryTransformExecuteFailure(e, out var transformed))
+                            {
+                                throw transformed;
+                            }
+
+                            throw;
+                        }
+
+                        await using (reader.ConfigureAwait(false))
+                        {
+                            await page.ApplyCallbacksAsync(reader, exceptions, token).ConfigureAwait(false);
+                            await reader.CloseAsync().ConfigureAwait(false);
+                        }
                     }
                     catch (Exception e)
                     {
@@ -259,32 +196,17 @@ internal class AutoClosingLifetime: ConnectionLifetimeBase, IConnectionLifetime,
             }
             catch (Exception e)
             {
-                try
-                {
-                    // #5688: never with the caller's token. Npgsql answers an already-cancelled token by
-                    // throwing without sending ROLLBACK, and that exception would replace this one.
-                    await tx.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-                }
-                catch (Exception rollbackEx)
-                {
-                    Logger.LogFailure(rollbackEx, "Error trying to rollback an exception");
-                    throw;
-                }
+                // #5688 / #6074: a failed rollback -- a broken connection took the transaction with it -- must not
+                // replace the failure that caused it
+                await tx.RollbackAfterFailureAsync(Logger).ConfigureAwait(false);
 
                 Logger.LogFailure(new NpgsqlCommand(), e);
-                transformAndThrow(pages.SelectMany(x => x.Operations).OfType<IExceptionTransform>(), e);
+                transformAndThrow(pages, e);
             }
 
             if (exceptions.Count == 1)
             {
-                try
-                {
-                    await tx.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-                }
-                catch (Exception e)
-                {
-                    Logger.LogFailure(e, "Failure trying to rollback an exception");
-                }
+                await tx.RollbackAfterFailureAsync(Logger).ConfigureAwait(false);
 
                 var ex = exceptions.Single();
                 ExceptionDispatchInfo.Throw(ex);
@@ -292,14 +214,7 @@ internal class AutoClosingLifetime: ConnectionLifetimeBase, IConnectionLifetime,
 
             if (exceptions.Any())
             {
-                try
-                {
-                    await tx.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-                }
-                catch (Exception e)
-                {
-                    Logger.LogFailure(e, "Failure trying to rollback an exception");
-                }
+                await tx.RollbackAfterFailureAsync(Logger).ConfigureAwait(false);
 
                 throw new AggregateException(exceptions);
             }
@@ -332,18 +247,46 @@ internal class AutoClosingLifetime: ConnectionLifetimeBase, IConnectionLifetime,
         }
     }
 
-    public IAlwaysConnectedLifetime Start()
-    {
-        var transaction = CreateStickyConnection();
-        transaction.BeginTransaction();
-        return transaction;
-    }
-
+    /// <remarks>
+    ///     #5881: the new lifetime belongs to nobody until it is returned. The session only takes ownership of it
+    ///     from the return value, so if beginning the transaction fails -- most often a token cancelled after the
+    ///     connection opened -- this method is the only place left that can give the connection back.
+    /// </remarks>
     public async Task<IAlwaysConnectedLifetime> StartAsync(CancellationToken token)
     {
         var transaction = CreateStickyConnection();
-        await transaction.BeginTransactionAsync(token).ConfigureAwait(false);
-        return transaction;
+        try
+        {
+            await transaction.BeginTransactionAsync(token).ConfigureAwait(false);
+            return transaction;
+        }
+        catch (Exception)
+        {
+            await transaction.DisposeAfterFailureAsync(Logger).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    /// <summary>
+    ///     #5881. Opens a connection for one operation and runs <see cref="AfterOpenedAsync" /> on it, closing it
+    ///     again if either fails. The callers that hand back a reader cannot use a <c>using</c> block, and the row
+    ///     level security subclass runs a command in <see cref="AfterOpenedAsync" /> -- a command that a cancelled
+    ///     token makes throw after the connection is already open.
+    /// </summary>
+    private async Task<NpgsqlConnection> openConnectionAsync(ConnectionUsage usage, CancellationToken token)
+    {
+        var conn = _database.CreateConnection(usage);
+        try
+        {
+            await conn.OpenAsync(token).ConfigureAwait(false);
+            await AfterOpenedAsync(conn, token).ConfigureAwait(false);
+            return conn;
+        }
+        catch (Exception)
+        {
+            await conn.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
     }
 
     protected virtual TransactionalConnection CreateStickyConnection()

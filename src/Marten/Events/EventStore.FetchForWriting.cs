@@ -67,7 +67,14 @@ internal partial class EventStore: IEventIdentityStrategy<Guid>, IEventIdentityS
     IEventStream<TDoc> IEventIdentityStrategy<Guid>.StartStream<TDoc>(TDoc? document, DocumentSessionBase session,
         Guid id, CancellationToken cancellation) where TDoc : class
     {
-        var action = _store.Events.StartEmptyStream(session, id);
+        // #6094: a stream this session already started (an earlier fetch of the same new stream, or a refused
+        // batch the caller is retrying) gets the same action, or the session would start it twice
+        if (!session.WorkTracker.TryFindStream(id, _store.Events.TenantToMatch(session), out var action)
+            || action.ActionType != StreamActionType.Start)
+        {
+            action = _store.Events.StartEmptyStream(session, id);
+        }
+
         action.AggregateType = typeof(TDoc);
         action.ExpectedVersionOnServer = 0;
 
@@ -132,7 +139,13 @@ internal partial class EventStore: IEventIdentityStrategy<Guid>, IEventIdentityS
     IEventStream<TDoc> IEventIdentityStrategy<string>.StartStream<TDoc>(TDoc? document, DocumentSessionBase session,
         string id, CancellationToken cancellation) where TDoc : class
     {
-        var action = _store.Events.StartEmptyStream(session, id);
+        // #6094: see the Guid overload
+        if (!session.WorkTracker.TryFindStream(id, _store.Events.TenantToMatch(session), out var action)
+            || action.ActionType != StreamActionType.Start)
+        {
+            action = _store.Events.StartEmptyStream(session, id);
+        }
+
         action.AggregateType = typeof(TDoc);
         action.ExpectedVersionOnServer = 0;
 
@@ -188,46 +201,9 @@ internal partial class EventStore: IEventIdentityStrategy<Guid>, IEventIdentityS
         return plan.FetchForReading(_session, id, cancellation);
     }
 
-    public Task<IEventStream<T>> FetchForWriting<T>(Guid id, CancellationToken cancellation = default) where T : class
-    {
-        var plan = FindFetchPlan<T, Guid>();
-        return plan.FetchForWriting(_session, id, false, cancellation);
-    }
-
-    public Task<IEventStream<T>> FetchForWriting<T>(string key, CancellationToken cancellation = default)
-        where T : class
-    {
-        var plan = FindFetchPlan<T, string>();
-        return plan.FetchForWriting(_session, key, false, cancellation);
-    }
-
-    public Task<IEventStream<T>> FetchForWriting<T>(Guid id, long initialVersion,
-        CancellationToken cancellation = default) where T : class
-    {
-        var plan = FindFetchPlan<T, Guid>();
-        return plan.FetchForWriting(_session, id, initialVersion, cancellation);
-    }
-
-    public Task<IEventStream<T>> FetchForWriting<T>(string key, long initialVersion,
-        CancellationToken cancellation = default) where T : class
-    {
-        var plan = FindFetchPlan<T, string>();
-        return plan.FetchForWriting(_session, key, initialVersion, cancellation);
-    }
-
-    public Task<IEventStream<T>> FetchForExclusiveWriting<T>(Guid id,
-        CancellationToken cancellation = default) where T : class
-    {
-        var plan = FindFetchPlan<T, Guid>();
-        return plan.FetchForWriting(_session, id, true, cancellation);
-    }
-
-    public Task<IEventStream<T>> FetchForExclusiveWriting<T>(string key,
-        CancellationToken cancellation = default) where T : class
-    {
-        var plan = FindFetchPlan<T, string>();
-        return plan.FetchForWriting(_session, key, true, cancellation);
-    }
+    // FetchForWriting<T> and FetchForExclusiveWriting<T> over a Guid or string id are EventOperationsBase's
+    // (jasperfx#1047), reaching the fetch plan through FetchForWritingCore. The natural-key overloads above
+    // stay here: they are where the stores differ in substance.
 
     public ValueTask<T?> FetchLatest<T>(Guid id, CancellationToken cancellation = default) where T : class
     {

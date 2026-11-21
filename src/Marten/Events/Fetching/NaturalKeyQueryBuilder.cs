@@ -99,8 +99,8 @@ internal class NaturalKeyQueryBuilder
         // #5344: archival is a property of the *stream*, and nothing on the write side copies it onto the
         // lookup row -- ArchiveStream() and the Archived event both go through mt_archive_stream, which has
         // never touched mt_natural_key_X. nk.is_archived above is kept because it is genuinely maintained
-        // under UseArchivedStreamPartitioning, where the cascading FK moves the lookup row along with its
-        // stream.
+        // under UseArchivedStreamPartitioning, where mt_archive_stream / mt_unarchive_stream copy the lookup
+        // row between partitions with its stream (marten#5476).
         builder.Append(" and s.is_archived = false");
 
         if (_filterByTenant)

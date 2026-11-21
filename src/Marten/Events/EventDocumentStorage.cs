@@ -23,6 +23,7 @@ using Marten.Linq.SqlGeneration;
 using Marten.Linq.SqlGeneration.Filters;
 using Marten.Services;
 using Marten.Storage;
+using Marten.Storage.Metadata;
 using Weasel.Core;
 using Weasel.Postgresql;
 using Weasel.Postgresql.SqlGeneration;
@@ -254,6 +255,7 @@ public abstract class EventDocumentStorage: IEventStorage, ILinqDocumentStorage
     public abstract Weasel.Storage.IStorageOperation UpdateStreamVersion(StreamAction stream);
     public abstract Weasel.Storage.IStorageOperation AssertStreamVersion(StreamAction stream);
     public abstract Weasel.Storage.IStorageOperation ArchiveStream(object streamId, string tenantId);
+    public abstract Weasel.Storage.IStorageOperation UnArchiveStream(object streamId, string tenantId);
     public abstract Weasel.Storage.IStorageOperation DeleteStream(object streamId, string tenantId);
 
     public string StreamStateSelectSql => Marten.EventStorage.StreamStateSql.Build(Events);
@@ -277,7 +279,7 @@ public abstract class EventDocumentStorage: IEventStorage, ILinqDocumentStorage
             var typeName = reader.GetFieldValue<string>(2);
             if (typeName.IsNotEmpty())
             {
-                state.AggregateType = Events.AggregateTypeFor(typeName);
+                state.AggregateType = Events.TryResolveAggregateType(typeName);
             }
         }
 
@@ -314,7 +316,7 @@ public abstract class EventDocumentStorage: IEventStorage, ILinqDocumentStorage
             var typeName = await reader.GetFieldValueAsync<string>(2, token).ConfigureAwait(false);
             if (typeName.IsNotEmpty())
             {
-                state.AggregateType = Events.AggregateTypeFor(typeName);
+                state.AggregateType = Events.TryResolveAggregateType(typeName);
             }
         }
 
@@ -383,8 +385,8 @@ public abstract class EventDocumentStorage: IEventStorage, ILinqDocumentStorage
                     $"or set opts.Events.DefaultBinarySerializer.");
             }
 
-            var bytes = reader.GetFieldValue<byte[]>(3);
-            var data = mapping.BinarySerializer.Deserialize(mapping.DocumentType, bytes);
+            // #5731: deserialize from a rented buffer rather than an exact-length byte[] per row.
+            var data = BinaryEventPayload.Read(reader, 3, mapping.BinarySerializer, mapping.DocumentType);
             @event = mapping.Wrap(data);
         }
         else
@@ -440,8 +442,9 @@ public abstract class EventDocumentStorage: IEventStorage, ILinqDocumentStorage
                         $"or set opts.Events.DefaultBinarySerializer.");
                 }
 
-                var bytes = await reader.GetFieldValueAsync<byte[]>(3, token).ConfigureAwait(false);
-                var data = mapping.BinarySerializer.Deserialize(mapping.DocumentType, bytes);
+                // #5731: as the sync overload. The row is already buffered once ReadAsync has returned, so
+                // the synchronous column copy inside BinaryEventPayload.Read does no I/O.
+                var data = BinaryEventPayload.Read(reader, 3, mapping.BinarySerializer, mapping.DocumentType);
                 @event = mapping.Wrap(data);
             }
             else
@@ -452,7 +455,14 @@ public abstract class EventDocumentStorage: IEventStorage, ILinqDocumentStorage
         catch (Exception e)
         {
             var sequence = await readSequenceAsync(reader, token).ConfigureAwait(false);
-            throw new EventDeserializationFailureException(sequence, mapping, e);
+
+            // marten#6003: the row's stream and tenant, read before anything else could fail, so the daemon can park
+            // the stream of a single-stream projection
+            var (streamId, streamKey, tenantId) = await readStreamAndTenantAsync(reader, token).ConfigureAwait(false);
+            throw new EventDeserializationFailureException(sequence, mapping, e)
+            {
+                StreamId = streamId, StreamKey = streamKey, TenantId = tenantId
+            };
         }
 
         await ApplyReaderDataToEventAsync(reader, @event, token).ConfigureAwait(false);
@@ -483,6 +493,43 @@ public abstract class EventDocumentStorage: IEventStorage, ILinqDocumentStorage
         }
     }
 
+    // marten#6003: best effort, like readSequenceAsync. This runs on a failure path.
+    private async Task<(Guid? StreamId, string? StreamKey, string? TenantId)> readStreamAndTenantAsync(
+        DbDataReader reader, CancellationToken token)
+    {
+        Guid? streamId = null;
+        string? streamKey = null;
+        string? tenantId = null;
+
+        try
+        {
+            var streamIndex = Array.IndexOf(_fields, "stream_id");
+            if (streamIndex >= 0 && !await reader.IsDBNullAsync(streamIndex, token).ConfigureAwait(false))
+            {
+                if (Events.StreamIdentity == StreamIdentity.AsGuid)
+                {
+                    streamId = await reader.GetFieldValueAsync<Guid>(streamIndex, token).ConfigureAwait(false);
+                }
+                else
+                {
+                    streamKey = await reader.GetFieldValueAsync<string>(streamIndex, token).ConfigureAwait(false);
+                }
+            }
+
+            var tenantIndex = Array.IndexOf(_fields, TenantIdColumn.Name);
+            if (tenantIndex >= 0 && !await reader.IsDBNullAsync(tenantIndex, token).ConfigureAwait(false))
+            {
+                tenantId = await reader.GetFieldValueAsync<string>(tenantIndex, token).ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            // Leave whatever could not be read unknown, rather than replace the real failure
+        }
+
+        return (streamId, streamKey, tenantId);
+    }
+
     private static async Task<long> readSequenceAsync(DbDataReader reader, CancellationToken token)
     {
         try
@@ -507,15 +554,8 @@ public abstract class EventDocumentStorage: IEventStorage, ILinqDocumentStorage
             throw new UnknownEventTypeException(eventTypeName, sequence);
         }
 
-        Type type;
-        try
-        {
-            type = Events.TypeForDotNetName(dotnetTypeName);
-        }
-        catch (ArgumentNullException)
-        {
-            throw new UnknownEventTypeException(dotnetTypeName, sequence);
-        }
+        var type = Events.ResolveEventType(dotnetTypeName)
+                   ?? throw new UnknownEventTypeException(dotnetTypeName, sequence);
 
         return Events.EventMappingFor(type);
     }

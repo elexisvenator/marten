@@ -40,6 +40,7 @@ public abstract class EventMapping: EventTypeData, IDocumentMapping, IEventType
     protected readonly DocumentMapping _inner;
     protected readonly EventGraph _parent;
     private readonly ISqlFragment _defaultWhereFragment;
+    private readonly ISqlFragment _eventTypeFilter;
 
     protected EventMapping(EventGraph parent, Type eventType) : base(eventType)
     {
@@ -54,8 +55,9 @@ public abstract class EventMapping: EventTypeData, IDocumentMapping, IEventType
 
         _inner = new DocumentMapping(eventType, parent.Options);
 
-        ISqlFragment filter = new WhereFragment($"d.type = '{EventTypeName}'");
-        filter = filter.CombineAnd(IsNotArchivedFilter.Instance);
+        _eventTypeFilter = new WhereFragment($"d.type = '{EventTypeName}'");
+
+        ISqlFragment filter = _eventTypeFilter.CombineAnd(IsNotArchivedFilter.Instance);
         if (parent.TenancyStyle == TenancyStyle.Conjoined)
         {
             filter = filter.CombineAnd(CurrentTenantFilter.Instance);
@@ -109,6 +111,15 @@ public abstract class EventMapping: EventTypeData, IDocumentMapping, IEventType
     }
 
     private JasperFx.Events.IEventBinarySerializer? _binarySerializer;
+
+    /// <summary>
+    ///     A serializer registration changed after this mapping resolved its answer, so resolve it again
+    ///     on next read.
+    /// </summary>
+    internal void ResetBinarySerializer()
+    {
+        _binarySerializerResolved = false;
+    }
 
     // volatile, and it matters now that resolution is lazy: the flag's release/acquire semantics are
     // what stop a racing reader from seeing "resolved" before the serializer reference it guards is
@@ -184,7 +195,9 @@ public abstract class EventMapping: EventTypeData, IDocumentMapping, IEventType
 
     private IEnumerable<ISqlFragment> extraFilters(ISqlFragment query)
     {
-        yield return _defaultWhereFragment;
+        // Only the event type here: the default where fragment also carries the archive and current
+        // tenant filters, which made an AnyTenant() or an archive filter in the query ineffective
+        yield return _eventTypeFilter;
         if (!query.SpecifiesEventArchivalStatus())
         {
             yield return IsNotArchivedFilter.Instance;

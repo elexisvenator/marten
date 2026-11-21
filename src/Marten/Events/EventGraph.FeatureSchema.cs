@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading;
 using JasperFx.Events.Aggregation;
 using JasperFx.Events.Daemon;
+using JasperFx.Events.Projections;
 using JasperFx.Events.Tags;
 using Marten.Events.Archiving;
 using Marten.Events.Projections;
@@ -49,14 +50,35 @@ public partial class EventGraph: IFeatureSchema
         // Nothing
     }
 
+    /// <summary>
+    /// marten#6003: the registered multi-stream projections that keep a slice index, with the table each one writes.
+    /// </summary>
+    internal IEnumerable<(IAggregateProjection Projection, SliceIndexTable Table)> SliceIndexedProjections()
+    {
+        foreach (var source in Options.Projections.All)
+        {
+            if (source is IAggregateProjection { Scope: AggregationScope.MultiStream } aggregate &&
+                source.Options.SliceIndex != null)
+            {
+                yield return (aggregate, new SliceIndexTable(this, source.Name, source.Version, aggregate.IdentityType));
+            }
+        }
+    }
+
+    internal IEnumerable<SliceIndexTable> SliceIndexTables() => SliceIndexedProjections().Select(x => x.Table);
+
     private IEnumerable<ISchemaObject> createAllSchemaObjects()
     {
         // DCB in HStore mode requires the Postgres hstore extension. Register it before
         // any table that depends on the hstore type is created.
-        if (DcbStorageMode == DcbStorageMode.HStore && _tagTypes.Count > 0)
+        if (DcbStorageMode == DcbStorageMode.HStore && TagTypes.Count > 0)
         {
             yield return new Extension("hstore");
         }
+
+        // #5812: must come before any event table, so a migration that rebuilds mt_events cannot take an owned
+        // mt_events_sequence down with it
+        yield return new EventSequenceOwnershipRelease(DatabaseSchemaName);
 
         yield return new StreamsTable(this);
 
@@ -67,15 +89,14 @@ public partial class EventGraph: IFeatureSchema
             yield return new StreamIdentityEnforcementTable(this);
         }
 
-        var eventsTable = new EventsTable(this);
+        var eventsTable = new EventsTable(this, true);
         yield return eventsTable;
 
         #region sample_using-sequence
 
-        var sequence = new Sequence(new PostgresqlObjectName(DatabaseSchemaName, "mt_events_sequence"))
-        {
-            Owner = eventsTable.Identifier, OwnerColumn = "seq_id"
-        };
+        // Deliberately not OWNED BY mt_events.seq_id (#5812): a rebuild of mt_events would drop it.
+        // See EventSequenceOwnershipRelease.
+        var sequence = new Sequence(new PostgresqlObjectName(DatabaseSchemaName, "mt_events_sequence"));
 
         #endregion
 
@@ -97,14 +118,26 @@ public partial class EventGraph: IFeatureSchema
         // jasperfx#809 (#5740): persisted projection start floors, which outlive rebuild teardown
         yield return new ProjectionFloorTable(this);
 
+        // jasperfx#1215 / #1222: the ceilings and cursors of stored-event rewrites and backfills, which outlive
+        // rebuild teardown and data resets like the floors
+        yield return new EventRangeMarkTable(this);
+
+        // marten#6003: the parked identities of async projections. Always created (#5309), so two stores over one
+        // schema never disagree about it
+        yield return new ParkedIdentitiesTable(this);
+
+        // marten#6003: one slice index per multi-stream projection version that opts in with UseSliceIndex()
+        foreach (var table in SliceIndexTables())
+        {
+            yield return table;
+        }
+
         yield return new SystemFunction(DatabaseSchemaName, "mt_mark_event_progression", "varchar, bigint");
 
-        if (EnableExtendedProgressionTracking)
-        {
-            yield return new SystemFunction(DatabaseSchemaName, "mt_mark_event_progression_extended",
-                "varchar, bigint, timestamp with time zone, varchar, text, integer");
-        }
         yield return new ArchiveStreamFunction(this);
+
+        // marten#5476: the reverse of mt_archive_stream, behind IEventStoreOperations.UnArchiveStream
+        yield return new ArchiveStreamFunction(this, unarchive: true);
 
         yield return new QuickAppendEventFunction(this);
 
@@ -123,17 +156,20 @@ public partial class EventGraph: IFeatureSchema
             }
         }
 
-        if (EnableAdvancedAsyncTracking)
-        {
-            yield return new EventProgressionSkippingTable(this);
-            yield return new SystemFunction(DatabaseSchemaName, "mt_mark_progression_with_skip",
-                "varchar, bigint, bigint");
-        }
+        // #5765: always created. EnableAdvancedAsyncTracking governs whether the daemon USES the skip
+        // table and function, not whether they exist, so a store with it off cannot drop them from a
+        // schema another store has it on for.
+        yield return new EventProgressionSkippingTable(this);
+
+        // #6007: the ledger of events that committed inside a skipped range
+        yield return new LateEventsTable(this);
+        yield return new SystemFunction(DatabaseSchemaName, "mt_mark_progression_with_skip",
+            "varchar, bigint, bigint");
 
         // In HStore mode tags live inline on mt_events.tags; no per-type tag tables exist.
         if (DcbStorageMode != DcbStorageMode.HStore)
         {
-            foreach (var tagRegistration in _tagTypes)
+            foreach (var tagRegistration in TagTypes)
             {
                 yield return new EventTagTable(this, tagRegistration);
             }
@@ -143,9 +179,13 @@ public partial class EventGraph: IFeatureSchema
         // Only relevant if at least one DCB tag type is registered (since the
         // table is keyed by tag_table/tag_value and would be dead weight in
         // event stores that don't use tags at all).
-        if (_tagTypes.Count > 0)
+        if (TagTypes.Count > 0)
         {
             yield return new DcbTagVersionTable(this);
+
+            // #6035: every value that table holds comes from here, so a row deleted by a tombstone and
+            // created again can never match a capture of the old one.
+            yield return DcbTagVersionTable.BuildSequence(this);
         }
     }
 }

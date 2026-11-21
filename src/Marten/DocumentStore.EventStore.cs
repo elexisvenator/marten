@@ -22,6 +22,7 @@ using Marten.Events.Daemon;
 using Marten.Events.Daemon.Internals;
 using Marten.Events.Daemon.Progress;
 using Marten.Events.Projections;
+using Marten.Events.Schema;
 using Marten.Exceptions;
 using Marten.Internal;
 using Marten.Internal.OpenTelemetry;
@@ -40,8 +41,6 @@ using Marten.Util;
 
 namespace Marten;
 
-[UnconditionalSuppressMessage("AOT", "IL3050",
-    Justification = "Class-level: uses Type.MakeGenericType / MethodInfo.MakeGenericMethod / Activator.CreateInstance / FastExpressionCompiler — runtime code generation. AOT consumers pre-generate codegen artifacts (codegen write) and supply source-generator-backed serializer impls per the AOT publishing guide.")]
 public partial class DocumentStore: IEventStore<IDocumentOperations, IQuerySession>, ISubscriptionRunner<ISubscription>
 {
     // #5741 (jasperfx#1029 part 2): Marten no longer registers NpgsqlException or MartenCommandException with
@@ -258,6 +257,13 @@ public partial class DocumentStore: IEventStore<IDocumentOperations, IQuerySessi
             }
         }
 
+        // marten#6003: an identity parked above the new floor parks again when the shard gets there, and the slice
+        // index rows above it are written again. The parks below the floor stay: those identities are still frozen.
+        foreach (var name in names)
+        {
+            queueParkedRewind(session, name, sequenceFloor ?? 0);
+        }
+
         if (tenantShard != null)
         {
             // Only this tenant's dead letters for this shard: every tenant draws its own sequence, so the
@@ -303,6 +309,12 @@ public partial class DocumentStore: IEventStore<IDocumentOperations, IQuerySessi
                 // #4981: keep last_updated in step with the rewound progress on the update branch
                 $"insert into {Options.EventGraph.ProgressionTable} (name, last_seq_id) values (?, ?) on conflict (name) do update set last_seq_id = ?, last_updated = transaction_timestamp()",
                 shardName, sequenceFloor, sequenceFloor);
+
+            // marten#6003: as RewindSubscriptionProgressAsync
+            if (ShardName.TryParse(shardName, out var parsed) && parsed != null)
+            {
+                queueParkedRewind(session, parsed, sequenceFloor);
+            }
         }
 
         await session.SaveChangesAsync(token).ConfigureAwait(false);
@@ -424,12 +436,34 @@ public partial class DocumentStore: IEventStore<IDocumentOperations, IQuerySessi
             teardownProjectionStorageForTenant(source, session, tenantId);
         }
 
-        foreach (var agent in source.Shards())
+        // A composite's members keep progression rows of their own, per tenant like the composite's, and the
+        // store-global teardown drops them with each leaf. Leaving them here made the rebuild's first batch,
+        // which inserts every member's progression from the floor, fail on pk_mt_event_progression.
+        IEnumerable<IProjectionSource<IDocumentOperations, IQuerySession>> progressed = source is CompositeProjection members
+            ? members.AllProjections().Append(source)
+            : [source];
+
+        foreach (var agent in progressed.SelectMany(x => x.Shards()))
         {
             // Compose the per-tenant ShardName so its Identity carries the
             // trailing :tenantId — that's the row this DELETE targets.
             var tenantShardName = ShardName.Compose(agent.Name.Name, agent.Name.ShardKey, tenantId, agent.Name.Version);
             session.QueueOperation(new DeleteProjectionProgress(Events, tenantShardName.Identity));
+        }
+
+        // marten#6003: the tenant's parked identities and slice index rows for this projection, as the store-global
+        // teardown clears them for every tenant
+        foreach (var leaf in progressed)
+        {
+            session.QueueSqlCommand(
+                $"delete from {Events.DatabaseSchemaName}.{ParkedIdentitiesTable.Name} where projection_name = ? and tenant_id = ?",
+                leaf.Name, tenantId);
+
+            if (sliceIndexTableFor(leaf.Name, leaf.Version) is { } sliceIndex)
+            {
+                session.QueueSqlCommand($"delete from {Events.DatabaseSchemaName}.{sliceIndex} where tenant_id = ?",
+                    tenantId);
+            }
         }
 
         // Note: DeadLetterEvent intentionally NOT wiped here. The store-global
@@ -440,6 +474,44 @@ public partial class DocumentStore: IEventStore<IDocumentOperations, IQuerySessi
         // rebuild and self-correct.
 
         await session.SaveChangesAsync(token).ConfigureAwait(false);
+    }
+
+    // marten#6003: the slice index table of a registered projection version that keeps one, or null
+    private string? sliceIndexTableFor(string projectionName, uint version)
+    {
+        var name = SliceIndexTable.NameFor(projectionName, version);
+        return Options.EventGraph.SliceIndexTables().Any(x => x.Identifier.Name == name) ? name : null;
+    }
+
+    // marten#6003: a rewind of one shard to a floor. A park whose failing event is above the floor goes, because the
+    // shard parks it again when it gets there; the slice index rows above the floor go, because they are written again.
+    private void queueParkedRewind(IDocumentSession session, ShardName name, long floor)
+    {
+        var schema = Events.DatabaseSchemaName;
+        if (name.TenantId == null)
+        {
+            session.QueueSqlCommand(
+                $"delete from {schema}.{ParkedIdentitiesTable.Name} where projection_name = ? and projection_version = ? and shard_key = ? and first_failing_seq > ?",
+                name.Name, (int)name.Version, name.ShardKey, floor);
+        }
+        else
+        {
+            session.QueueSqlCommand(
+                $"delete from {schema}.{ParkedIdentitiesTable.Name} where projection_name = ? and projection_version = ? and shard_key = ? and tenant_id = ? and first_failing_seq > ?",
+                name.Name, (int)name.Version, name.ShardKey, name.TenantId, floor);
+        }
+
+        if (sliceIndexTableFor(name.Name, name.Version) is not { } sliceIndex) return;
+
+        if (name.TenantId == null)
+        {
+            session.QueueSqlCommand($"delete from {schema}.{sliceIndex} where seq_id > ?", floor);
+        }
+        else
+        {
+            session.QueueSqlCommand($"delete from {schema}.{sliceIndex} where tenant_id = ? and seq_id > ?",
+                name.TenantId, floor);
+        }
     }
 
     private void teardownProjectionStorageForTenant(IProjectionSource<IDocumentOperations, IQuerySession> source,
@@ -465,6 +537,17 @@ public partial class DocumentStore: IEventStore<IDocumentOperations, IQuerySessi
 
         // Rewind previous DeadLetterEvents because you're going to replay them all anyway
         session.DeleteWhere<DeadLetterEvent>(x => x.ProjectionName == source.Name);
+
+        // marten#6003: a rebuild re-folds every identity, so nothing stays parked, and it writes the slice index
+        // again from its start
+        session.QueueSqlCommand(
+            $"delete from {Events.DatabaseSchemaName}.{ParkedIdentitiesTable.Name} where projection_name = ?",
+            source.Name);
+
+        if (sliceIndexTableFor(source.Name, source.Version) is { } sliceIndex)
+        {
+            session.QueueSqlCommand($"delete from {Events.DatabaseSchemaName}.{sliceIndex}");
+        }
 
         // #4788: a [NaturalKey] aggregate maintains its mt_natural_key_X lookup table via the
         // auto-registered NaturalKeyProjection on the inline-append path. Teardown of the parent
@@ -577,12 +660,31 @@ public partial class DocumentStore: IEventStore<IDocumentOperations, IQuerySessi
     /// </remarks>
     internal static ResiliencePipeline DaemonLoaderPipeline => ResiliencePipeline.Empty;
 
+    /// <summary>
+    ///     jasperfx#1256. The pipeline the async daemon builds a projection batch through, so a batch whose build
+    ///     failed transiently (a dropped connection, a deadlock, a command timeout, an exhausted pool) is built again
+    ///     under every error policy before the shard pauses with <c>ShardFailure.IsTransient</c> true.
+    /// </summary>
+    /// <remarks>
+    ///     <para>
+    ///         Deliberately not <c>Options.ResiliencePipeline</c>, for the reason <see cref="DaemonLoaderPipeline" />
+    ///         is empty: every command in the build already runs through that pipeline inside its session, and the
+    ///         two would nest (#5587). This one is its own, small policy
+    ///         (<see cref="ResilientPipelineBuilderExtensions.AddMartenDaemonBatchDefaults" />): three retries with a
+    ///         short exponential backoff, and it retries timeouts, which the session pipeline does not.
+    ///     </para>
+    /// </remarks>
+    internal static ResiliencePipeline DaemonBatchPipeline { get; } =
+        new ResiliencePipelineBuilder().AddMartenDaemonBatchDefaults().Build();
+
+    ResiliencePipeline IEventStore<IDocumentOperations, IQuerySession>.ResiliencePipeline => DaemonBatchPipeline;
+
     IEventLoader IEventStore<IDocumentOperations, IQuerySession>.BuildEventLoader(IEventDatabase database,
         ILogger loggerFactory, EventFilterable filtering, AsyncOptions shardOptions)
     {
         var filters = buildEventLoaderFilters(filtering).ToArray();
         var inner = new EventLoader(this, (MartenDatabase)database, shardOptions, filters,
-            filtering.IncludeArchivedEvents);
+            filtering.IncludeArchivedEvents) { IncludeEventTags = filtering.IncludeEventTags };
         return new ResilientEventLoader(DaemonLoaderPipeline, inner, database);
     }
 
@@ -604,19 +706,35 @@ public partial class DocumentStore: IEventStore<IDocumentOperations, IQuerySessi
     {
         var filters = buildEventLoaderFilters(filtering).ToArray();
         var inner = new EventLoader(this, (MartenDatabase)database, shardOptions, filters,
-            filtering.IncludeArchivedEvents, shardName);
+            filtering.IncludeArchivedEvents, shardName) { IncludeEventTags = filtering.IncludeEventTags };
         return new ResilientEventLoader(DaemonLoaderPipeline, inner, database);
     }
 
+    [UnconditionalSuppressMessage("AOT", "IL3050",
+        Justification = "Uses Type.MakeGenericType / MethodInfo.MakeGenericMethod / Activator.CreateInstance / FastExpressionCompiler — runtime code generation. AOT consumers supply source-generator-backed serializer impls per the AOT publishing guide.")]
     private IEnumerable<ISqlFragment> buildEventLoaderFilters(EventFilterable filterable)
+        => buildEventLoaderFilters(filterable.IncludedEventTypes, filterable.StreamType,
+            filterable.IncludeArchivedEvents,
+            filterable is IAggregateProjection aggregateProjection ? [aggregateProjection.AggregateType] : []);
+
+    /// <summary>
+    ///     The daemon loader's filters, from their parts. The per-identity rebuild loader (marten#6071) builds the
+    ///     same filters from an <see cref="IdentityRebuildEventRequest" />, which carries no projection.
+    /// </summary>
+    [UnconditionalSuppressMessage("AOT", "IL3050",
+        Justification = "Uses Type.MakeGenericType for Compacted<T>, as the daemon loader always has. AOT consumers supply source-generator-backed serializer impls per the AOT publishing guide.")]
+    [UnconditionalSuppressMessage("Trimming", "IL2055",
+        Justification = "Compacted<T> over a registered aggregate type, as the daemon loader always has.")]
+    internal IEnumerable<ISqlFragment> buildEventLoaderFilters(IReadOnlyCollection<Type> includedEventTypes,
+        Type? streamType, bool includeArchivedEvents, IReadOnlyCollection<Type> aggregateTypes)
     {
-        if (filterable.IncludedEventTypes.Any() && !filterable.IncludedEventTypes.Any(x => x.IsAbstract || x.IsInterface))
+        if (includedEventTypes.Any() && !includedEventTypes.Any(x => x.IsAbstract || x.IsInterface))
         {
             // We want to explicitly add in the archived event
-            var allTypes = filterable.IncludedEventTypes.Concat([typeof(Archived)]).ToArray();
-            if (filterable is IAggregateProjection aggregateProjection)
+            var allTypes = includedEventTypes.Concat([typeof(Archived)]).ToArray();
+            foreach (var aggregateType in aggregateTypes)
             {
-                var compactedType = typeof(Compacted<>).MakeGenericType(aggregateProjection.AggregateType);
+                var compactedType = typeof(Compacted<>).MakeGenericType(aggregateType);
                 allTypes = allTypes.Concat([compactedType])
                     .ToArray();
             }
@@ -626,12 +744,12 @@ public partial class DocumentStore: IEventStore<IDocumentOperations, IQuerySessi
 
         }
 
-        if (filterable.StreamType != null)
+        if (streamType != null)
         {
-            yield return new AggregateTypeFilter(filterable.StreamType, Options.EventGraph);
+            yield return new AggregateTypeFilter(streamType, Options.EventGraph);
         }
 
-        if (!filterable.IncludeArchivedEvents)
+        if (!includeArchivedEvents)
         {
             yield return IsNotArchivedFilter.Instance;
         }
@@ -729,18 +847,9 @@ public partial class DocumentStore: IEventStore<IDocumentOperations, IQuerySessi
         // right "shard halts on error" vs "view related dead letters" affordance.
         // Normal-run + rebuild-mode are mirrored as separate descriptors because
         // they carry independent ErrorHandlingOptions on the store.
-        usage.ProjectionErrors = new ProjectionErrorHandlingDescriptor
-        {
-            SkipApplyErrors = Options.Projections.Errors.SkipApplyErrors,
-            SkipUnknownEvents = Options.Projections.Errors.SkipUnknownEvents,
-            SkipSerializationErrors = Options.Projections.Errors.SkipSerializationErrors
-        };
-        usage.ProjectionRebuildErrors = new ProjectionErrorHandlingDescriptor
-        {
-            SkipApplyErrors = Options.Projections.RebuildErrors.SkipApplyErrors,
-            SkipUnknownEvents = Options.Projections.RebuildErrors.SkipUnknownEvents,
-            SkipSerializationErrors = Options.Projections.RebuildErrors.SkipSerializationErrors
-        };
+        // marten#6003: the descriptors carry the error actions (Pause, Skip or Park) and the parking cap too
+        usage.ProjectionErrors = ProjectionErrorHandlingDescriptor.For(Options.Projections.Errors);
+        usage.ProjectionRebuildErrors = ProjectionErrorHandlingDescriptor.For(Options.Projections.RebuildErrors);
 
         // jasperfx#434 / marten#4710: surface the effective rebuild cap so monitoring tools
         // (CritterWatch#309's rebuild dispatcher) can size their orchestration off the wire.
@@ -950,6 +1059,8 @@ public partial class DocumentStore: IEventStore<IDocumentOperations, IQuerySessi
     Task IEventStore.CompactStreamAsync(string streamKey, string? tenantId, CancellationToken token)
         => compactUntypedAsync(streamKey, tenantId, token);
 
+    [UnconditionalSuppressMessage("AOT", "IL3050",
+        Justification = "Uses Type.MakeGenericType / MethodInfo.MakeGenericMethod / Activator.CreateInstance / FastExpressionCompiler — runtime code generation. AOT consumers supply source-generator-backed serializer impls per the AOT publishing guide.")]
     private async Task compactUntypedAsync(Guid streamId, string? tenantId, CancellationToken token)
     {
         await using var session = tenantId == null ? LightweightSession() : LightweightSession(tenantId);
@@ -973,6 +1084,8 @@ public partial class DocumentStore: IEventStore<IDocumentOperations, IQuerySessi
         await ((Task)genericMethod.Invoke(null, [session, streamId, token])!).ConfigureAwait(false);
     }
 
+    [UnconditionalSuppressMessage("AOT", "IL3050",
+        Justification = "Uses Type.MakeGenericType / MethodInfo.MakeGenericMethod / Activator.CreateInstance / FastExpressionCompiler — runtime code generation. AOT consumers supply source-generator-backed serializer impls per the AOT publishing guide.")]
     private async Task compactUntypedAsync(string streamKey, string? tenantId, CancellationToken token)
     {
         await using var session = tenantId == null ? LightweightSession() : LightweightSession(tenantId);

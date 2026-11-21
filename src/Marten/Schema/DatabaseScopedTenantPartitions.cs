@@ -265,7 +265,10 @@ public class DatabaseScopedTenantPartitions: ManagedListPartitions, IListPartiti
         {
             var statuses = await base.AddPartitionToAllTables(logger, database, values, token).ConfigureAwait(false);
 
-            var swept = await sweepTablesDiscoveredInDatabaseAsync(logger, database, values, statuses, token)
+            // Weasel can record a value under a different suffix than the one requested (weasel#896)
+            var recorded = await recordedSuffixesAsync(database, values, token).ConfigureAwait(false);
+
+            var swept = await sweepTablesDiscoveredInDatabaseAsync(logger, database, recorded, statuses, token)
                 .ConfigureAwait(false);
 
             return swept.Count == 0 ? statuses : statuses.Concat(swept).ToArray();
@@ -294,7 +297,9 @@ public class DatabaseScopedTenantPartitions: ManagedListPartitions, IListPartiti
         {
             await base.AddPartitionToAllTables(database, value, suffix, token).ConfigureAwait(false);
 
-            await sweepTablesDiscoveredInDatabaseAsync(NullLogger.Instance, database, values, [], token)
+            var recorded = await recordedSuffixesAsync(database, values, token).ConfigureAwait(false);
+
+            await sweepTablesDiscoveredInDatabaseAsync(NullLogger.Instance, database, recorded, [], token)
                 .ConfigureAwait(false);
         }
         finally
@@ -302,6 +307,43 @@ public class DatabaseScopedTenantPartitions: ManagedListPartitions, IListPartiti
             TenantPartitionDatabaseScope.Current = prior;
         }
     }
+
+    /// <summary>
+    /// weasel#896: a value that an existing partition's bound still covers goes back into that partition's
+    /// bucket, and is recorded in the registry under the bucket's suffix rather than the requested one. Re-read
+    /// this database's registry so its view holds what Weasel wrote, and return the suffix each of the requested
+    /// values ended up with.
+    /// </summary>
+    private async Task<Dictionary<string, string>> recordedSuffixesAsync(PostgresqlDatabase database,
+        IReadOnlyDictionary<string, string> requested, CancellationToken token)
+    {
+        await hydrateWithFreshConnectionAsync(database, token, force: true).ConfigureAwait(false);
+
+        var view = PartitionsFor(database);
+        return requested.ToDictionary(pair => pair.Key,
+            pair => view.TryGetValue(pair.Key, out var recorded) ? recorded : pair.Value);
+    }
+
+    /// <summary>
+    /// The catalog query behind the #4944 sweep: every LIST-partitioned parent in the schemas bound to
+    /// <c>:schemas</c> whose single partition key column is <c>:tenantColumn</c>, and that is not itself a
+    /// partition. Shared with the synchronous provisioned check (#5986), so the two can never disagree about
+    /// which tables the sweep visits.
+    /// </summary>
+    internal const string TenantPartitionedParentsSql =
+        """
+        select n.nspname, c.relname
+        from pg_catalog.pg_class c
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+        join pg_catalog.pg_partitioned_table p on p.partrelid = c.oid
+        join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = p.partattrs[0]
+        where c.relkind = 'p'
+          and n.nspname = any(:schemas)
+          and p.partstrat = 'l'
+          and p.partnatts = 1
+          and a.attname = :tenantColumn
+          and not exists (select 1 from pg_catalog.pg_inherits i where i.inhrelid = c.oid)
+        """;
 
     /// <summary>
     /// #4944 — the database-driven half of the partition sweep.
@@ -400,20 +442,7 @@ public class DatabaseScopedTenantPartitions: ManagedListPartitions, IListPartiti
             var discovered = new List<DbObjectName>();
 
             // Filter (1) + (2), enforced in the catalog query itself.
-            await using (var reader = await conn.CreateCommand(
-                                 """
-                                 select n.nspname, c.relname
-                                 from pg_catalog.pg_class c
-                                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace
-                                 join pg_catalog.pg_partitioned_table p on p.partrelid = c.oid
-                                 join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = p.partattrs[0]
-                                 where c.relkind = 'p'
-                                   and n.nspname = any(:schemas)
-                                   and p.partstrat = 'l'
-                                   and p.partnatts = 1
-                                   and a.attname = :tenantColumn
-                                   and not exists (select 1 from pg_catalog.pg_inherits i where i.inhrelid = c.oid)
-                                 """)
+            await using (var reader = await conn.CreateCommand(TenantPartitionedParentsSql)
                              .With("schemas", schemas)
                              .With("tenantColumn", TenantIdColumn.Name)
                              .ExecuteReaderAsync(token).ConfigureAwait(false))
@@ -500,6 +529,7 @@ public class DatabaseScopedTenantPartitions: ManagedListPartitions, IListPartiti
     /// Database-scoped counterpart of the base by-value drop. Resolves the partition suffix from
     /// THIS database's registry — the base implementation resolves from the store-wide snapshot,
     /// which under sharded tenancy may have been hydrated from a different database entirely.
+    /// A value that shares its partition with other values only leaves that partition; the others keep it.
     /// </summary>
     public new async Task DropPartitionFromAllTablesForValue(PostgresqlDatabase database, ILogger logger,
         string value, CancellationToken token)
@@ -509,12 +539,48 @@ public class DatabaseScopedTenantPartitions: ManagedListPartitions, IListPartiti
         if (_databases.TryFind(database.Identifier, out var set) && set.Hydrated
             && set.Values.TryGetValue(value, out var suffix))
         {
-            await DropPartitionFromAllTables(database, logger, [suffix], token).ConfigureAwait(false);
+            // Compared as partition table names, the way Weasel buckets them
+            var partitionSuffix = partitionTableSuffix(suffix);
+            var sharesItsPartition = set.Values.Any(pair =>
+                pair.Key != value && partitionTableSuffix(pair.Value) == partitionSuffix);
+
+            if (!sharesItsPartition)
+            {
+                await DropPartitionFromAllTables(database, logger, [suffix], token).ConfigureAwait(false);
+                return;
+            }
+
+            // Other tenants share this partition ("bucketing"). Dropping by suffix would drop their rows and
+            // registry entries too, so let Weasel take just this value out of the bucket (weasel#391/#891). The
+            // base method works from the store-wide map, so load that from this database's registry first.
+            await dropValueFromSharedPartitionAsync(database, logger, value, token).ConfigureAwait(false);
             return;
         }
 
         throw new ArgumentOutOfRangeException(nameof(value),
             $"Could not find a partition with the value '{value}' in database '{database.Identifier}'");
+    }
+
+    private static string partitionTableSuffix(string suffix) => new ListPartition(suffix).Suffix;
+
+    private async Task dropValueFromSharedPartitionAsync(PostgresqlDatabase database, ILogger logger, string value,
+        CancellationToken token)
+    {
+        base.ForceReload();
+
+        var prior = TenantPartitionDatabaseScope.Current;
+        TenantPartitionDatabaseScope.Current = database;
+        try
+        {
+            await base.InitializeAsync(database, token).ConfigureAwait(false);
+            await base.DropPartitionFromAllTablesForValue(database, logger, value, token).ConfigureAwait(false);
+        }
+        finally
+        {
+            TenantPartitionDatabaseScope.Current = prior;
+        }
+
+        await hydrateWithFreshConnectionAsync(database, token, force: true).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -527,6 +593,39 @@ public class DatabaseScopedTenantPartitions: ManagedListPartitions, IListPartiti
         foreach (var entry in _databases.Enumerate())
         {
             entry.Value.Hydrated = false;
+        }
+    }
+
+    /// <summary>
+    /// #5986: the in-memory half of <see cref="AddPartitionToAllTables(ILogger, PostgresqlDatabase, Dictionary{string, string}, CancellationToken)"/>,
+    /// for a database whose registry was just read synchronously and already holds every value. The result is
+    /// what that method leaves behind: this database's view replaced by the registry, as a forced
+    /// <see cref="HydrateAsync"/> does, with the values merged over it.
+    /// </summary>
+    /// <param name="registry">The database's registry as <see cref="HydrateAsync"/> reads it: value to lower-cased suffix.</param>
+    internal void PublishHydratedView(IDatabase database, IReadOnlyDictionary<string, string> registry,
+        IReadOnlyDictionary<string, string> values)
+    {
+        var updated = new Dictionary<string, string>();
+        foreach (var pair in registry)
+        {
+            updated[pair.Key] = pair.Value;
+        }
+
+        foreach (var pair in values)
+        {
+            updated[pair.Key] = pair.Value;
+        }
+
+        var set = setFor(database.Identifier);
+
+        // Not under set.Lock: that semaphore is held across a query by HydrateAsync, and waiting on it here would
+        // block this thread on asynchronous work again. Publishing the finished snapshot under _databasesLock is
+        // atomic for readers, which see either the previous view or this one.
+        lock (_databasesLock)
+        {
+            set.Values = updated;
+            set.Hydrated = true;
         }
     }
 

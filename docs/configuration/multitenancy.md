@@ -138,6 +138,34 @@ If instead you provision a known set of tenant databases up front through
 provider. See [Azure Database for PostgreSQL with Entra ID](/configuration/azure-managed-identity#database-provisioning-with-a-rotating-credential).
 :::
 
+### Provisioning command timeout {#provisioning-command-timeout}
+
+Creating a database can take a while on a busy server, longer than the command timeout you tuned for queries. So
+`CREATE DATABASE` and `DROP DATABASE` run under their own command timeout, two minutes by default. Every other command
+keeps the store's command timeout. The provisioning timeout only ever lengthens the timeout, so a longer store command
+timeout is kept, and `TimeSpan.Zero` means no limit.
+
+```cs
+opts.MultiTenantedWithSingleServer(connectionString, t =>
+{
+    t.WithTenants("tenant1", "tenant2");
+    t.ProvisioningCommandTimeout = TimeSpan.FromMinutes(5);
+});
+```
+
+`CreateDatabasesForTenants()` has the same setting, and extension installs (`CREATE EXTENSION`) use the one on
+Weasel's migrator:
+
+```cs
+opts.CreateDatabasesForTenants(c =>
+{
+    c.ProvisioningCommandTimeout(TimeSpan.FromMinutes(5));
+    c.ForTenant().CheckAgainstPgDatabase();
+});
+
+opts.Advanced.Migrator.ProvisioningCommandTimeout = TimeSpan.FromMinutes(5);
+```
+
 ## Master Table Tenancy Model
 
 ::: info
@@ -216,10 +244,15 @@ This new Marten tenancy strategy will first look for a database with the “tena
 and if it’s not found, will try to reach into the database table to “find” the connection string for this 
 newly discovered tenant. If a record is found, the new tenancy strategy caches the information, and proceeds just like normal.
 
+The cache follows the table. Disabling, removing or clearing tenants through the tenancy evicts them straight away, and
+whenever Marten re-reads the table (as the async daemon does to discover new tenant databases), a cached tenant whose
+row has since been deleted or disabled, by another node or by hand, is evicted too. A disabled tenant is refused with
+`DisabledTenantException`, an unregistered one with `UnknownTenantIdException`.
+
 Now, let me try to anticipate a couple questions you might have here:
 
 * **Can Marten track and apply database schema changes to new tenant databases at runtime?** Yes, Marten does the schema check tracking on a database by database basis. This means that if you add a new tenant database to that underlying table, Marten will absolutely be able to make schema changes as needed to just that tenant database regardless of the state of other tenant databases.
-* **Will the Marten command line tools recognize new tenant databases?** Yes, same thing. If you call dotnet run -- marten-apply for example, Marten will do the schema migrations independently for each tenant database, so any outstanding changes will be performed on each tenant database.
+* **Will the Marten command line tools recognize new tenant databases?** Yes, same thing. If you call `dotnet run -- db-apply` for example (see [db-apply](https://weasel.jasperfx.net/cli/db-apply.html), whose `--parallel` flag exists for exactly this case), Marten will do the schema migrations independently for each tenant database, so any outstanding changes will be performed on each tenant database. The same goes for `db-assert`, `db-patch` and `resources setup`.
 * **Can Marten spin up asynchronous projections for a new tenant database without requiring downtime?** Yes! Check out this big ol’ integration test proving that the new Marten V7 version of the async daemon can handle that just fine:
 
 ```csharp
@@ -472,6 +505,52 @@ Sharded multi-tenancy also composes with
 across the database pool, while `Events.UseTenantPartitionedEvents` physically isolates each tenant's events (and
 projection progress) *within* whichever database hosts that tenant, running one daemon agent per (database, tenant).
 
+## Synchronous sessions and tenants that are not cached yet
+
+The synchronous session factories (`LightweightSession(tenantId)`, `QuerySession(tenantId)`, `OpenSession(...)`
+and the rest) and synchronous `ForTenant(tenantId)` have to resolve the tenant's database before they can return.
+Apart from the static mapping, which knows its databases up front, that takes a trip to the database the first time
+a process sees a tenant. The answer is cached, so it happens **once per tenant per process**.
+
+How that first resolution runs depends on the tenancy:
+
+| Tenancy | First synchronous resolution of a tenant |
+| --- | --- |
+| Master table | Reads the tenant's row from the control table with synchronous I/O on the calling thread ([weasel#838](https://github.com/JasperFx/weasel/issues/838)). Still blocks the calling thread on asynchronous work for the first tenant resolution in the process, which checks the control table's schema, and for every other resolution that starts before that one has finished: `ApplyAllDatabaseChangesOnStartup()` or one `GetTenantAsync()` at startup does that work ahead of the first request. Also blocks when the control database's connection string turns on `Multiplexing`, which Npgsql only supports asynchronously |
+| Single instance | Checks that the tenant's database exists, and runs `CREATE DATABASE` when it does not, with synchronous I/O on the calling thread ([weasel#839](https://github.com/JasperFx/weasel/issues/839)). The new database's schema is not applied here: as before, that happens on its first write. Still blocks the calling thread on asynchronous work when the master connection string turns on `Multiplexing` |
+| Sharded | For a tenant that already has a shard and all of its partitions, reads the assignment and checks the partitions with synchronous I/O on the calling thread ([#5986](https://github.com/JasperFx/marten/issues/5986)). Still blocks the calling thread on asynchronous work for the first tenant resolution in the process, which checks the pool's tables and seeds the configured databases; for a new tenant, which goes through your assignment strategy's `AssignTenantToDatabaseAsync()`; for a tenant whose partitions or event sequence are missing and get repaired; and when the control or shard database's connection string turns on `Multiplexing`, which Npgsql only supports asynchronously |
+
+A thread-pool thread blocked on asynchronous work waits for that work to be finished by another pool thread. Take a
+burst of synchronous session opens for tenants that this process has not seen yet, such as the first requests after a
+deploy or a batch of newly onboarded tenants. In the cases above that still block, that burst can hold every pool
+thread, so the work they are all waiting on cannot run, and the whole process stalls until the thread pool has added
+enough threads. Synchronous I/O holds the calling thread too, but only for its own round trip, and it does not need
+another pool thread to finish.
+
+A single instance tenancy resolves uncached tenants one at a time, synchronous callers on one lock and asynchronous
+callers on another, and a caller gives up with a `TimeoutException` after waiting five seconds for the others. That
+only matters when a burst of brand-new tenants all need `CREATE DATABASE` at once.
+
+To keep that off the synchronous path:
+
+* **Warm the tenants you already know at startup.** `ApplyAllDatabaseChangesOnStartup()` builds every database the
+  tenancy knows about, and that caches every tenant in a master table, every assigned tenant of a sharded tenancy and
+  every tenant declared with `WithTenants()` for a single instance tenancy. For a master table or sharded tenancy it
+  also does the one-off work that keeps later tenants on the synchronous path.
+* **Resolve a new tenant asynchronously before its first synchronous session.** Do it where the tenant is
+  onboarded, or in asynchronous middleware ahead of the code that opens the session:
+
+```cs
+// Caches the tenant, so the synchronous session below finds it without a database round trip
+await store.Tenancy.GetTenantAsync(tenantId);
+
+using var session = store.LightweightSession(tenantId);
+```
+
+* **Use an asynchronous session factory** where the session's semantics fit, for example
+  `LightweightSerializableSessionAsync(tenantId)` or `QuerySerializableSessionAsync(tenantId)`. These resolve the
+  tenant asynchronously, but they open a serializable transaction.
+
 ## Dynamically applying changes to tenants databases
 
 If you didn't call the `ApplyAllDatabaseChangesOnStartup` method, Marten would still try to create a database [upon the session creation](/documents/sessions). This action is invasive and can cause issues like timeouts, cold starts, or deadlocks. It also won't apply all defined changes upfront (so, e.g. [indexes](/documents/indexing/), [custom schema extensions](/schema/extensions)).
@@ -646,3 +725,45 @@ await database.ApplyAllConfiguredChangesToDatabaseAsync();
 <!-- endSnippet -->
 
 All remaining methods on `IDocumentStore.Advanced` apply to all databases.
+
+### Querying Across All Databases
+
+With a multi-database tenancy there is no session that spans databases, so a query that has to answer for the whole
+fleet has to visit every database. `QueryAcrossAllDatabasesAsync()` opens a query session per database, runs your
+query with bounded parallelism, and flattens the results:
+
+```cs
+var users = await store.Advanced.QueryAcrossAllDatabasesAsync(
+    async (session, ct) => await session.Query<User>()
+        .Where(x => x.Age > 30)
+        .ToListAsync(ct),
+    maxParallelism: 16);
+
+// Or, when the query also needs the database itself (daemon progression, statistics, ...)
+var names = await store.Advanced.QueryAcrossAllDatabasesAsync<string>(
+    (session, database, ct) => Task.FromResult<IReadOnlyList<string>>([database.Identifier]));
+```
+
+The query reads every tenant. For conjoined documents and events, which is everything under
+`MultiTenantedWithShardedDatabases()`, each session reads all the tenants in its database: LINQ queries, compiled
+queries, `LoadAsync()` / `LoadManyAsync()` and `FetchStreamAsync()` alike. An `AnyTenant()` or `TenantIsOneOf()` in
+your query still applies as written. If two tenants in one database share a document id, `LoadAsync()` returns one of them; use
+`LoadManyAsync()` or a query when that matters.
+
+To read only some tenants, pass their ids at the end. Marten only visits the databases that hold those tenants, and
+each session only reads those tenants' rows, as if your query said `TenantIsOneOf(...)`:
+
+```cs
+var users = await store.Advanced.QueryAcrossAllDatabasesAsync(
+    async (session, ct) => await session.Query<User>().ToListAsync(ct),
+    8, cancellationToken, "tenant1", "tenant7");
+```
+
+A tenant id the store does not know throws an `UnknownTenantIdException` before any database is queried. No tenant
+ids at all is an empty result.
+
+The results are grouped per database: each database's items stay together. The order of the databases is whatever the
+store lists for that call, and for sharded and master table tenancies that order can differ from one call to the next.
+
+Each parallel slot holds one connection to a different database, so pick `maxParallelism` with the size of your
+connection pools in mind. The first failing database fails the whole call.

@@ -33,7 +33,7 @@ namespace Marten.Events
 
         /// <summary>
         /// Opt into having Marten process "side effects" on aggregation projections (SingleStreamProjection/MultiStreamProjection) while
-        /// running in an Inline lifecycle. Default is false;
+        /// running in an Inline lifecycle. Default is true since 10.0; set false (or call StoreOptions.RestoreV9Defaults()) to opt out
         /// </summary>
         bool EnableSideEffectsOnInlineProjections { get; set; }
 
@@ -69,8 +69,8 @@ namespace Marten.Events
         ///     semantics, which are shared across the Critter Stack.
         ///     </para>
         ///     <para>
-        ///     Supported for both the Async and Inline lifecycles; see
-        ///     <see cref="EventGraph.CacheAggregatesForWriting{T}" /> for how they differ.
+        ///     Supported for the Async and Inline lifecycles, and since Marten 10 for Live aggregates, where a hit
+        ///     reads only the events after the cached version instead of the whole stream (#5225).
         ///     </para>
         /// </summary>
         /// <param name="sizeLimit">Maximum number of cached aggregates, when the default cache is built</param>
@@ -107,21 +107,22 @@ namespace Marten.Events
         /// <summary>
         /// Opt into using bigint (64-bit) types for event version, sequence, and return
         /// values in PostgreSQL functions. Prevents integer overflow when sequence values
-        /// exceed int32 range. Default is false. Will become true in Marten 9.0.
+        /// exceed int32 range. Default is true since Marten 9.0.
         /// </summary>
         public bool EnableBigIntEvents { get; set; }
 
         public EventAppendMode AppendMode { get; set; }
 
         /// <summary>
-        /// Opt into more robust tracking of asynchronous projection behavior. Default is false. This will add
-        /// extra tables, functions, and columns to your Marten event store schema
+        /// Opt into more robust tracking of asynchronous projection behavior. Default is true since Marten 9.0.
+        /// This adds extra tables, functions, and columns to your Marten event store schema
         /// </summary>
         public bool EnableAdvancedAsyncTracking { get; set; }
 
         /// <summary>
-        /// Opt into using PostgreSQL list partitioning. This can have significant performance and scalability benefits
-        /// *if* you are also aggressively using event stream archiving
+        /// Partition the event tables by <c>is_archived</c> with PostgreSQL list partitioning, so archived streams
+        /// and their events stay out of the active partition. Default is true since 10.0, except under
+        /// UseTenantPartitionedEvents, where it is off. Changing it on an existing store rebuilds mt_events and mt_streams
         /// </summary>
         public bool UseArchivedStreamPartitioning { get; set; }
 
@@ -132,7 +133,8 @@ namespace Marten.Events
         /// table at append time and translates a unique violation there into
         /// <see cref="ExistingStreamIdCollisionException"/>. This catches reuse
         /// of an identity even after the original stream was archived under
-        /// <see cref="UseArchivedStreamPartitioning"/>. Defaults to false.
+        /// <see cref="UseArchivedStreamPartitioning"/>. Defaults to true since 10.0, except under
+    /// UseTenantPartitionedEvents, where it is off.
         /// </summary>
         public bool EnableStrictStreamIdentityEnforcement { get; set; }
 
@@ -179,14 +181,13 @@ namespace Marten.Events
         /// <summary>
         /// Opt into some performance optimizations for projection rebuilds for both single stream and
         /// multi-stream projections. This will result in new table columns and a potential database
-        /// migration. This will be a default in Marten 8.
+        /// migration. Default is false.
         /// </summary>
         public bool UseOptimizedProjectionRebuilds { get; set; }
 
         /// <summary>
         /// Does Marten require a stream type for any new event streams? This will also
-        /// validate that an event stream already exists as part of appending events. Default in 7.0 is false,
-        /// but this will be true in 8.0
+        /// validate that an event stream already exists as part of appending events. Default is false.
         /// </summary>
         public bool UseMandatoryStreamTypeDeclaration { get; set; }
 
@@ -210,8 +211,8 @@ namespace Marten.Events
         public EventNamingStyle EventNamingStyle { get; set; }
 
         /// <summary>
-        /// This is an "opt in" feature to add the capability to mark some events as "skipped" in the database
-        /// meaning that they do not apply to projections or subscriptions. Use this to "cure" bad events
+        /// Leave events marked as "skipped" in the database out of projections and subscriptions. Use this to
+        /// "cure" bad events. Default is true since 10.0
         /// </summary>
         public bool EnableEventSkippingInProjectionsOrSubscriptions { get; set; }
 
@@ -238,13 +239,22 @@ namespace Marten.Events
         public int? DcbTagVersionFillFactor { get; set; }
 
         /// <summary>
-        /// When enabled, adds FOR UPDATE to the stream version SELECT inside
-        /// mt_quick_append_events for OCC (optimistic concurrency) appends.
-        /// This prevents a READ COMMITTED race where two concurrent transactions
-        /// both pass the version check before either commits, both call nextval(),
-        /// and the loser fails with a 23505 — leaving a permanent gap in
-        /// mt_events_sequence that stalls QueryForNonStaleData.
-        /// Defaults to false to preserve existing throughput characteristics.
+        /// #5887. What makes a later append conflict with a Dynamic Consistency Boundary read by
+        /// <c>FetchForWritingByTags</c>. Defaults to <see cref="Marten.Events.DcbConflictScope.TagValueAndEventType"/>
+        /// since Marten 10: a query condition naming event types (<c>AndEventsOfType</c>) only conflicts
+        /// with later events of those types, as the DCB specification does.
+        /// <see cref="Marten.Events.DcbConflictScope.TagValue"/>, the Marten 9 default, conflicts on any
+        /// appended event carrying a tag value the boundary read. Upgrading a running Marten 9 system is a
+        /// two-step rollout through <see cref="Marten.Events.DcbConflictScope.TagValueRecordingEventTypes"/> —
+        /// see the remarks on <see cref="Marten.Events.DcbConflictScope"/>.
+        /// </summary>
+        public DcbConflictScope DcbConflictScope { get; set; }
+
+        /// <summary>
+        /// Takes FOR UPDATE instead of FOR NO KEY UPDATE on the stream's mt_streams row when
+        /// mt_quick_append_events reads the stream version. Since #6066 the function locks that row
+        /// before inserting any events either way, so concurrent appends to one stream already wait
+        /// their turn and an optimistic loser raises MT003 before any nextval() call. Defaults to false.
         /// </summary>
         public bool UseExclusiveLockOnConcurrentAppends { get; set; }
 
@@ -698,7 +708,7 @@ namespace Marten.Events
         /// <see cref="IEventStoreInstrumentation.ExtendedProgressionEnabled"/> as a sibling so
         /// store-agnostic monitoring tooling (e.g. <c>Wolverine.CritterWatch.Marten</c>) can flip
         /// the switch via the JasperFx.Events abstraction without referencing Marten's concrete
-        /// option type. Both names refer to the same underlying field; new code is encouraged to
+        /// option type. Both names refer to the same underlying field (on by default since 10.0, #5763); new code is encouraged to
         /// prefer <c>ExtendedProgressionEnabled</c> on the interface.
         /// </para>
         /// </summary>

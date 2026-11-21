@@ -175,9 +175,28 @@ internal sealed class EventLoader: IEventLoader
 
     public IMartenDatabase Database { get; }
 
+    /// <summary>
+    /// marten#6003: read the stored DCB tags of every loaded event, for a projection that groups by them
+    /// (<c>IdentityFromTag&lt;TTag&gt;()</c> sets <see cref="EventFilterable.IncludeEventTags" />).
+    /// </summary>
+    internal bool IncludeEventTags { get; init; }
+
     // Exposed for regression tests that assert the generated fetch SQL (e.g. the
     // #4745 archived-stream-partition pruning predicate). Not used at runtime.
     internal string CommandText => _command.CommandText;
+
+    /// <summary>
+    /// #5888: every page is read against a high-water mark the daemon took on the PRIMARY, so the page
+    /// has to come from the primary too. A plain QuerySession follows ReadSessionPreference, and a
+    /// lagging standby returns a short page whose ceiling is the high-water mark -- progression then
+    /// moves past events the standby has not replayed, and they are never projected.
+    /// </summary>
+    private QuerySession openSession()
+    {
+        var options = SessionOptions.ForDatabase(Database);
+        options.ReadFromPrimary = true;
+        return (QuerySession)_store.QuerySession(options);
+    }
 
     public async Task<EventPage> LoadAsync(EventRequest request, CancellationToken token)
     {
@@ -252,7 +271,7 @@ internal sealed class EventLoader: IEventLoader
         // window-step loader already keeps the original floor for the same reason.
         var page = new EventPage(pageFloor ?? request.Floor);
 
-        await using var session = (QuerySession)_store.QuerySession(SessionOptions.ForDatabase(Database));
+        await using var session = openSession();
         _floor.Value = request.Floor;
         _ceiling.Value = request.HighWater;
 
@@ -290,7 +309,13 @@ internal sealed class EventLoader: IEventLoader
                 }
                 catch (EventDeserializationFailureException e)
                 {
-                    if (request.ErrorOptions.SkipSerializationErrors)
+                    if (request.ParksUnreadableEvents)
+                    {
+                        // marten#6003: the daemon parks the event's stream instead
+                        reportUnreadable(page, e);
+                        skippedEvents++;
+                    }
+                    else if (request.ErrorOptions.SkipSerializationErrors)
                     {
                         runtime.Logger.EventDeserializationException(e.InnerException!.GetType().Name!, e.Sequence);
                         runtime.Logger.EventDeserializationExceptionDebug(e);
@@ -310,6 +335,11 @@ internal sealed class EventLoader: IEventLoader
         }
 
         page.CalculateCeiling(_batchSize, request.HighWater, skippedEvents);
+
+        if (IncludeEventTags)
+        {
+            await EventTagHydrator.HydrateAsync(_store.Options.EventGraph, session, page, token).ConfigureAwait(false);
+        }
 
         // If we got results, reset to normal strategy for next batch
         if (page.Count > 0 && _currentStrategy != LoadStrategy.Normal)
@@ -405,7 +435,7 @@ internal sealed class EventLoader: IEventLoader
     /// </summary>
     private async Task<EventPage> loadWithSkipAheadAsync(EventRequest request, CancellationToken token)
     {
-        await using var session = (QuerySession)_store.QuerySession(SessionOptions.ForDatabase(Database));
+        await using var session = openSession();
 
         var probeCommand = buildSkipAheadCommand(request.Floor);
         long? nextMatchingSeqId;
@@ -436,7 +466,8 @@ internal sealed class EventLoader: IEventLoader
             BatchSize = request.BatchSize,
             ErrorOptions = request.ErrorOptions,
             Runtime = request.Runtime,
-            Name = request.Name
+            Name = request.Name,
+            ParksUnreadableEvents = request.ParksUnreadableEvents
         };
 
         _floor.Value = adjustedRequest.Floor;
@@ -464,7 +495,7 @@ internal sealed class EventLoader: IEventLoader
             _floor.Value = currentFloor;
             _ceiling.Value = windowCeiling;
 
-            await using var session = (QuerySession)_store.QuerySession(SessionOptions.ForDatabase(Database));
+            await using var session = openSession();
             var page = new EventPage(request.Floor); // Use original floor for page tracking
 
             // #5239: both counters exist to keep the page's ceiling honest about what this window
@@ -504,7 +535,13 @@ internal sealed class EventLoader: IEventLoader
                     }
                     catch (EventDeserializationFailureException e)
                     {
-                        if (request.ErrorOptions.SkipSerializationErrors)
+                        if (request.ParksUnreadableEvents)
+                        {
+                            // marten#6003: the daemon parks the event's stream instead
+                            reportUnreadable(page, e);
+                            skippedEvents++;
+                        }
+                        else if (request.ErrorOptions.SkipSerializationErrors)
                         {
                             request.Runtime.Logger.EventDeserializationException(e.InnerException!.GetType().Name!, e.Sequence);
                             await request.Runtime.RecordDeadLetterEventAsync(e.ToDeadLetterEvent(request.Name)).ConfigureAwait(false);
@@ -541,6 +578,12 @@ internal sealed class EventLoader: IEventLoader
                 // intended behaviour of a stepping strategy.
                 page.CalculateCeiling(_batchSize, windowCeiling, skippedEvents);
 
+                if (IncludeEventTags)
+                {
+                    await EventTagHydrator.HydrateAsync(_store.Options.EventGraph, session, page, token)
+                        .ConfigureAwait(false);
+                }
+
                 // Found events — reset strategy for next batch
                 _currentStrategy = LoadStrategy.Normal;
                 return page;
@@ -556,6 +599,15 @@ internal sealed class EventLoader: IEventLoader
         var emptyPage = new EventPage(request.Floor);
         emptyPage.CalculateCeiling(_batchSize, highWater, 0);
         return emptyPage;
+    }
+
+    // marten#6003: an event the store can't deserialize, reported with the row's stream and tenant (which
+    // EventDocumentStorage reads before it gives up) so the daemon can park the stream
+    private static void reportUnreadable(EventPage page, EventDeserializationFailureException e)
+    {
+        page.AddUnreadable(new UnreadableEvent(e.Sequence, e.StreamId == Guid.Empty ? null : e.StreamId,
+            e.StreamKey, e.TenantId, e.EventTypeName, e));
+        page.LastObservedSequence = e.Sequence;
     }
 
     // internal (not private) so the #4720 regression test can assert the chain-walking directly.

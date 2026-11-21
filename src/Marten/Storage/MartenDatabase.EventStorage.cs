@@ -108,7 +108,7 @@ public partial class MartenDatabase : IEventDatabase
     ///     Deliberately plain UPDATE statements instead of a database function, so no schema object is
     ///     added and deployments running <c>AutoCreate.None</c> pick it up without a migration. Semantics
     ///     match the <c>mt_mark_event_progression_extended</c> function this replaced (the function is
-    ///     still installed for anything calling it directly): update-only telemetry decoration of
+    ///     no longer created; a copy left by an older version is harmless): update-only telemetry decoration of
     ///     existing progression rows — never INSERT, never touch <c>last_seq_id</c> / <c>last_updated</c>,
     ///     shards without a progression row yet are skipped silently.
     ///     <para>
@@ -170,6 +170,7 @@ public partial class MartenDatabase : IEventDatabase
                 command.Parameters.Add(new NpgsqlParameter("failure_event_type", NpgsqlDbType.Varchar));
             var failureTenantId =
                 command.Parameters.Add(new NpgsqlParameter("failure_tenant_id", NpgsqlDbType.Varchar));
+            var parkedCount = command.Parameters.Add(new NpgsqlParameter("parked_count", NpgsqlDbType.Integer));
 
             // The writer already hands these over sorted, but a direct caller need not, and the ordering
             // is what keeps two racing writers from deadlocking against each other.
@@ -187,6 +188,9 @@ public partial class MartenDatabase : IEventDatabase
                 failureSequence.Value = (object?)failure?.Event?.Sequence ?? DBNull.Value;
                 failureEventType.Value = (object?)failure?.Event?.EventTypeName ?? DBNull.Value;
                 failureTenantId.Value = (object?)failure?.Event?.TenantId ?? DBNull.Value;
+                // marten#6003: null is "not known in this publication" (a start, a pause), not "not parking", so it
+                // keeps the last count rather than erasing it
+                parkedCount.Value = (object?)state.ParkedCount ?? DBNull.Value;
 
                 // One ExecuteNonQueryAsync per shard, deliberately: each is its own implicit transaction,
                 // so this loop never holds more than a single row lock at a time.
@@ -210,12 +214,14 @@ public partial class MartenDatabase : IEventDatabase
                 failure_category = case when :touch_failure then :failure_category else p.failure_category end,
                 failure_event_sequence = case when :touch_failure then :failure_sequence else p.failure_event_sequence end,
                 failure_event_type = case when :touch_failure then :failure_event_type else p.failure_event_type end,
-                failure_event_tenant_id = case when :touch_failure then :failure_tenant_id else p.failure_event_tenant_id end
+                failure_event_tenant_id = case when :touch_failure then :failure_tenant_id else p.failure_event_tenant_id end,
+                parked_count = coalesce(:parked_count, p.parked_count)
             where p.name = :name
               and (p.heartbeat is distinct from :heartbeat
                 or p.agent_status is distinct from :agent_status
                 or p.pause_reason is distinct from :pause_reason
                 or p.running_on_node is distinct from :running_on_node
+                or (:parked_count is not null and p.parked_count is distinct from :parked_count)
                 or (:touch_failure
                     and (p.failure_category is distinct from :failure_category
                       or p.failure_event_sequence is distinct from :failure_sequence
@@ -289,6 +295,95 @@ public partial class MartenDatabase : IEventDatabase
         {
             await conn.CloseAsync().ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    ///     jasperfx#1150: for each position, the timestamp of the first non-archived event past it, which is
+    ///     the age of the oldest event a shard at that position has not processed yet. Null when nothing lies
+    ///     past the position. Answers come back one per position, in the order asked, duplicates included.
+    ///     <para>
+    ///     One round trip: every distinct position becomes its own <c>order by seq_id limit 1</c> seek in a
+    ///     single <see cref="NpgsqlBatch" />, so each lookup reads at most one row off the seq_id index
+    ///     instead of counting or scanning. Separate statements rather than one <c>LATERAL</c> join over the
+    ///     positions so that a tenant-filtered seek gets a plan with the tenant fixed, which is what lets
+    ///     Postgres prune <c>mt_events</c> to one partition under <c>UseTenantPartitionedEvents</c>.
+    ///     </para>
+    ///     <para>
+    ///     A tenant narrows the seek only when events are conjoined (which includes per-tenant partitioning,
+    ///     where each tenant draws its own sequence); otherwise the database is the scope and the tenant is
+    ///     ignored, as in <see cref="markEventsAsSkippedAsync" />. Archived events are skipped, as the daemon's
+    ///     <c>EventLoader</c> skips them.
+    ///     </para>
+    /// </summary>
+    public async Task<IReadOnlyList<PendingEventAge>> FetchFirstEventTimestampsAfterAsync(
+        IReadOnlyList<(string? TenantId, long Sequence)> positions, CancellationToken token = default)
+    {
+        if (positions.Count == 0)
+        {
+            return [];
+        }
+
+        var filterByTenant = Options.Events.TenancyStyle == TenancyStyle.Conjoined ||
+                             Options.Events.UseTenantPartitionedEvents;
+
+        // The tenant that actually narrows each seek, so two positions that differ only by an ignored
+        // tenant share one statement
+        (string? TenantId, long Sequence) lookupFor((string? TenantId, long Sequence) position) =>
+            (filterByTenant ? position.TenantId : null, position.Sequence);
+
+        var lookups = positions.Select(lookupFor).Distinct().ToArray();
+        var timestamps = new Dictionary<(string? TenantId, long Sequence), DateTimeOffset?>(lookups.Length);
+
+        var table = $"{Options.Events.DatabaseSchemaName}.mt_events";
+
+        await EnsureStorageExistsAsync(typeof(IEvent), token).ConfigureAwait(false);
+
+        await using var conn = CreateConnection();
+        try
+        {
+            await conn.OpenAsync(token).ConfigureAwait(false);
+
+            await using var batch = new NpgsqlBatch(conn);
+            foreach (var (tenantId, sequence) in lookups)
+            {
+                var command = new NpgsqlBatchCommand(tenantId == null
+                    ? $"select timestamp from {table} where seq_id > $1 and is_archived = false order by seq_id limit 1"
+                    : $"select timestamp from {table} where seq_id > $1 and is_archived = false and tenant_id = $2 order by seq_id limit 1");
+
+                command.Parameters.Add(new NpgsqlParameter { Value = sequence, NpgsqlDbType = NpgsqlDbType.Bigint });
+                if (tenantId != null)
+                {
+                    command.Parameters.Add(new NpgsqlParameter { Value = tenantId, NpgsqlDbType = NpgsqlDbType.Varchar });
+                }
+
+                batch.BatchCommands.Add(command);
+            }
+
+            await using var reader = await batch.ExecuteReaderAsync(token).ConfigureAwait(false);
+            foreach (var lookup in lookups)
+            {
+                timestamps[lookup] = await reader.ReadAsync(token).ConfigureAwait(false)
+                    ? await reader.GetFieldValueAsync<DateTimeOffset>(0, token).ConfigureAwait(false)
+                    : null;
+
+                await reader.NextResultAsync(token).ConfigureAwait(false);
+            }
+        }
+        catch (Exception e) when (isMissingEventStorage(e))
+        {
+            // No event storage means no events, so every position is caught up
+            logMissingEventStorage(e, nameof(FetchFirstEventTimestampsAfterAsync));
+            timestamps.Clear();
+        }
+        finally
+        {
+            await conn.CloseAsync().ConfigureAwait(false);
+        }
+
+        return positions
+            .Select(p => new PendingEventAge(p.TenantId, p.Sequence,
+                timestamps.TryGetValue(lookupFor(p), out var timestamp) ? timestamp : null))
+            .ToList();
     }
 
     string IEventDatabase.StorageIdentifier => _storageIdentifier;
@@ -798,6 +893,9 @@ select count(*) from {Options.Events.DatabaseSchemaName}.mt_streams;
             session.QueueOperation(new DeleteProjectionProgress(Options.EventGraph, shardIdentity));
 
             await session.SaveChangesAsync(token).ConfigureAwait(false);
+
+            // marten#6003: the ejected version's parked identities and slice index rows go with it
+            await DeleteParkedAndSliceIndexRowsForShardAsync(shardIdentity, token).ConfigureAwait(false);
         }
         catch (Exception e) when (isMissingEventStorage(e))
         {

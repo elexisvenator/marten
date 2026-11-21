@@ -12,6 +12,7 @@ using Marten.EventStorage.Quick;
 using Marten.EventStorage.Querying;
 using Marten.Internal;
 using Marten.Internal.Operations;
+using Marten.Internal.OpenTelemetry;
 using Marten.Linq.QueryHandlers;
 using Marten.Services;
 
@@ -107,7 +108,11 @@ internal sealed class ClosedShapeEventDocumentStorage: EventDocumentStorage
 
         // #5772: the variant that reads its seq_id back is not an AppendEventOperationBase, so verbose tracing
         // could not see which event it appends. See TracedQuickAppendEventOperation.
+        // #5730: the wrapper is only ever read by EventTracingConnectionLifetime, which SessionOptions only
+        // builds while something listens to the "Marten" source, so with no listener it is pure allocation.
+        // Asked per call rather than once here because a tracer can attach after the store is built.
         return _traceAppendedEvents && op is not Weasel.Storage.AppendEventOperationBase and not NoDataReturnedCall
+                                    && MartenTracing.ActivitySource.HasListeners()
             ? new TracedQuickAppendEventOperation(op, stream, e)
             : op;
     }
@@ -119,14 +124,22 @@ internal sealed class ClosedShapeEventDocumentStorage: EventDocumentStorage
             : StringStorage.QuickAppendEvents(stream);
     }
 
-    // #4968: route stream archive through the shared Weasel seam. Marten only ever archives (never
-    // un-archives through this path), so pass archived: true; the dialect's factory builds the Postgres
+    // #4968: route stream archive through the shared Weasel seam; the dialect's factory builds the Postgres
     // ArchiveStreamOperation.
     public override Weasel.Storage.IStorageOperation ArchiveStream(object streamId, string tenantId)
     {
         return Events.StreamIdentity == StreamIdentity.AsGuid
             ? GuidStorage.ArchiveStream(streamId, tenantId, true)
             : StringStorage.ArchiveStream(streamId, tenantId, true);
+    }
+
+    // marten#5476: the same seam slot with archived: false, which the dialect builds as a call to
+    // mt_unarchive_stream.
+    public override Weasel.Storage.IStorageOperation UnArchiveStream(object streamId, string tenantId)
+    {
+        return Events.StreamIdentity == StreamIdentity.AsGuid
+            ? GuidStorage.ArchiveStream(streamId, tenantId, false)
+            : StringStorage.ArchiveStream(streamId, tenantId, false);
     }
 
     // marten#5673: the hard delete rides the seam's TombstoneStream slot, which the dialect fills with

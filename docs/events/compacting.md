@@ -4,6 +4,12 @@ One of the earliest lessons I learned designing software systems is that reignin
 
 Let’s say that you failed to be omniscient in your event stream modeling and ended up with a longer stream of events than you’d ideally like and that is bloating your database size and maybe impacting performance. Maybe you’re going to be in a spot where you don’t really care about all the old events, but really just want to maintain the current projected state and more recent events. And maybe you’d like to throw the old events in some kind of “cold” storage like an S3 bucket or [something to be determined later].
 
+::: warning Compacting is not erasure
+Compacting replaces old events with a snapshot of the aggregate, and that snapshot still carries whatever the old
+events put into it. The archiver you pass may also keep copies of the removed events somewhere else. If you need to
+erase a person's data, for example for a GDPR request, see [Personal data and crypto-shredding with Tayra](/events/protection#personal-data-and-crypto-shredding-with-tayra).
+:::
+
 Enter the new “Stream Compacting.” Let's say that you have event streams for a piece of equipment in a job site, and record
 events every time the equipment is moved around the job site (this is based on an IoT system that one of our users built out with Marten),
 and the stream for a piece of `Equipment` can grow quite large over time -- but you don't necessarily care about events older
@@ -93,7 +99,7 @@ public sealed class SampleArchiverDocumentation : IEventsArchiver<IDocumentOpera
     }
 }
 ```
-<sup><a href='https://github.com/JasperFx/marten/blob/master/src/Marten/Events/EventStore.StreamCompacting.cs#L202-L234' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_ieventsarchiver' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/marten/blob/master/src/Marten/Events/EventStore.StreamCompacting.cs#L296-L329' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_ieventsarchiver' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 By default, Marten is *not* archiving events in this operation.
@@ -112,8 +118,18 @@ nothing threw. Look for those with `Compacted<T>` events whose `Snapshot` is nul
 or from wherever your archiver copied them to.
 :::
 
-Stream compacting will not have any adverse impact on running asynchronous projections and even carrying out a compacting operation while an 
-asynchronous projection happens to be working on exactly that stream will not cause any discrepancies with the daemon as it runs.
+Compacting deletes events, so Marten refuses to compact a stream while any asynchronous projection or subscription has not
+processed its events yet. `CompactStreamAsync()` throws an `InvalidOperationException` naming the projections and subscriptions
+that are behind, and nothing is compacted; compact again once they caught up. A projection or subscription that has never run
+counts as behind. The one exception is a single stream projection of the type you are compacting to, which reads the `Compacted<T>`
+snapshot instead of the deleted events. Before this check, a multi-stream projection or a subscription (Wolverine's event forwarding
+included) that was behind never saw the compacted events at all ([#6050](https://github.com/JasperFx/marten/issues/6050)).
+
+Being past an event isn't always proof of having seen it. When the async daemon's high water mark skips a sequence range, an
+event can still commit late inside that range, after every projection moved past it. The daemon's late event recovery checks
+a skipped range for such events for `LateEventDetectionWindow` (one hour by default) after the skip. Until it's done, Marten also refuses
+to compact a stream whose events sit in the gaps of that range, and the exception names the skip, its range, and when recovery
+will close it ([#6114](https://github.com/JasperFx/marten/issues/6114)). This needs `EnableAdvancedAsyncTracking`, which is on by default.
 
 You can compact a single stream repeatedly over time. For example, you may choose to compact a stream any time every time it becomes over 
 a 1,000 events long. In that case, Marten is completely replacing the `Compacted<T>` with the new snapshot version. The old `Compacted<T>` event
@@ -127,4 +143,5 @@ This isn't an insurmountable problem, but it's definitely not convenient. I thin
 event in the projection for T2 if both T1 and T2 are separate views of the same stream type. 
 
 Lastly, stream compacting is a complement to the [event stream archiving](/events/archiving) functionality, and not a replacement. 
-You may want to use both together.
+You may want to use both together. See [Shrinking mt_events](/events/shrinking) for how the two compare, and why you compact a stream before
+archiving it.

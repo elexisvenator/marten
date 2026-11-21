@@ -1,6 +1,7 @@
 #nullable enable
 using System;
 using System.Linq;
+using JasperFx.Core;
 using JasperFx.Core.Reflection;
 using Marten.Internal;
 using Marten.Internal.Storage;
@@ -45,7 +46,7 @@ public static class ClosedShapeRegistration
                 $"{typeof(TDoc).Name} must use a Guid id to register with sequential-GUID identity — found {mapping.IdType.Name}.");
         }
 
-        var identification = new SequentialGuidIdentification<TDoc>(mapping.IdMember);
+        var identification = new SequentialGuidIdentification<TDoc>(mapping.IdMember, SequentialGuid.PostgresOrder);
         RegisterClosedShape<TDoc, Guid>(documentStore, mapping, identification);
     }
 
@@ -110,7 +111,7 @@ public static class ClosedShapeRegistration
         {
             IIdentification<TDoc, Guid> identification = mapping.IdStrategy is GuidIdGeneration
                 ? new GuidIdentification<TDoc>(mapping.IdMember)
-                : new SequentialGuidIdentification<TDoc>(mapping.IdMember);
+                : new SequentialGuidIdentification<TDoc>(mapping.IdMember, SequentialGuid.PostgresOrder);
             return BuildProvider<TDoc, Guid>(mapping, identification);
         }
 
@@ -196,20 +197,17 @@ public static class ClosedShapeRegistration
     {
         var descriptor = DocumentStorageDescriptorBuilder.Build<TDoc, TId>(mapping, identification);
 
-        var queryOnly = new QueryOnlyClosedShapeStorage<TDoc, TId>(mapping, descriptor);
+        // #5733: the four tracking modes are Weasel's closed-shape bases (weasel#811), each carrying
+        // Marten's rules and LINQ facet. The write operations and selectors come from the bases for the
+        // descriptor's concurrency mode, so there is one storage per tracking mode rather than one per
+        // (tracking mode, concurrency mode) pair.
+        var rules = new MartenClosedShapeStorageRules<TDoc, TId>(mapping);
 
-        // #4659: dispatch on ConcurrencyMode ONCE at registration time so the
-        // three writeable storage styles are monomorphic-by-construction
-        // (each leaf knows its concurrency mode at type identity, no per-
-        // operation / per-row reads of _descriptor.ConcurrencyMode left).
-        var lightweight = BuildLightweightStorage(mapping, descriptor);
-        var identityMap = BuildIdentityMapStorage(mapping, descriptor);
-        var dirtyTracking = BuildDirtyCheckedStorage(mapping, descriptor);
+        var queryOnly = new QueryOnlyClosedShapeStorage<TDoc, TId>(descriptor, rules);
+        var lightweight = new LightweightClosedShapeStorage<TDoc, TId>(descriptor, rules);
+        var identityMap = new IdentityMapClosedShapeStorage<TDoc, TId>(descriptor, rules);
+        var dirtyTracking = new DirtyCheckedClosedShapeStorage<TDoc, TId>(descriptor, rules);
 
-        // M16: real bulk loader, COPY-based, built from the descriptor's
-        // column list. Lightweight is fine to use as the storage backing
-        // here since BulkLoader<T, TId> only calls IDocumentStorage's
-        // AssignIdentity / Identity through it.
         var bulkLoader = new ClosedShapeBulkLoader<TDoc, TId>(lightweight, descriptor, mapping);
         return new MartenDocumentProvider<TDoc>(
             bulkLoader,
@@ -218,37 +216,4 @@ public static class ClosedShapeRegistration
             identityMap: identityMap,
             dirtyTracking: dirtyTracking);
     }
-
-    private static LightweightClosedShapeStorage<TDoc, TId> BuildLightweightStorage<TDoc, TId>(
-        DocumentMapping mapping, DocumentStorageDescriptor<TDoc, TId> descriptor)
-        where TDoc : notnull
-        where TId : notnull
-        => descriptor.ConcurrencyMode switch
-        {
-            ConcurrencyMode.Optimistic => new OptimisticLightweightClosedShapeStorage<TDoc, TId>(mapping, descriptor),
-            ConcurrencyMode.Numeric => new NumericLightweightClosedShapeStorage<TDoc, TId>(mapping, descriptor),
-            _ => new UnversionedLightweightClosedShapeStorage<TDoc, TId>(mapping, descriptor),
-        };
-
-    private static IdentityMapClosedShapeStorage<TDoc, TId> BuildIdentityMapStorage<TDoc, TId>(
-        DocumentMapping mapping, DocumentStorageDescriptor<TDoc, TId> descriptor)
-        where TDoc : notnull
-        where TId : notnull
-        => descriptor.ConcurrencyMode switch
-        {
-            ConcurrencyMode.Optimistic => new OptimisticIdentityMapClosedShapeStorage<TDoc, TId>(mapping, descriptor),
-            ConcurrencyMode.Numeric => new NumericIdentityMapClosedShapeStorage<TDoc, TId>(mapping, descriptor),
-            _ => new UnversionedIdentityMapClosedShapeStorage<TDoc, TId>(mapping, descriptor),
-        };
-
-    private static DirtyCheckedClosedShapeStorage<TDoc, TId> BuildDirtyCheckedStorage<TDoc, TId>(
-        DocumentMapping mapping, DocumentStorageDescriptor<TDoc, TId> descriptor)
-        where TDoc : notnull
-        where TId : notnull
-        => descriptor.ConcurrencyMode switch
-        {
-            ConcurrencyMode.Optimistic => new OptimisticDirtyCheckedClosedShapeStorage<TDoc, TId>(mapping, descriptor),
-            ConcurrencyMode.Numeric => new NumericDirtyCheckedClosedShapeStorage<TDoc, TId>(mapping, descriptor),
-            _ => new UnversionedDirtyCheckedClosedShapeStorage<TDoc, TId>(mapping, descriptor),
-        };
 }

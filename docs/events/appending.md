@@ -258,6 +258,30 @@ public async Task append_optimistic(IDocumentSession session, Guid streamId, obj
 <sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/Examples/StartStreamSamples.cs#L76-L88' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_append_optimistic_event' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
+## Concurrent Appends to One Stream
+
+Under Quick append, the `mt_quick_append_events` function locks the stream's `mt_streams` row
+(`for no key update`) when it reads the stream version, before it draws any event sequence numbers.
+Concurrent appends to one stream, and `FetchForExclusiveWriting()` of that stream, wait their turn on that one lock.
+
+An append that carries an expected stream version (`FetchForWriting()`, `AppendOptimistic()`, `StartStream()` with
+a version) and had to wait sees the winner's version and throws the concurrency exception _before_ any sequence
+number is drawn, so it leaves no gap in `mt_events.seq_id`. A plain `Append()` that had to wait goes in after the
+append ahead of it.
+
+Before Marten 10 the function read the version without a lock, so concurrent optimistic appends could both pass the
+check, and the loser left a permanent sequence gap that an async daemon projection had to wait out. The lock was only
+taken at the end, which could also deadlock ([#6066](https://github.com/JasperFx/marten/issues/6066)).
+
+`UseExclusiveLockOnConcurrentAppends` still works and takes `for update` instead of `for no key update`:
+
+```cs
+opts.Events.UseExclusiveLockOnConcurrentAppends = true;
+```
+
+There is little reason left to turn it on. Measurements of the locked version read under contention, from when it
+was opt-in, are in `src/EventAppenderPerfTester/Results.md`.
+
 ## Serialized Access to the Stream
 
 The `AppendExclusive()` method will actually reserve a database lock on the stream itself until the

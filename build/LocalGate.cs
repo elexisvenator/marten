@@ -38,12 +38,13 @@ using static Nuke.Common.Tools.DotNet.DotNetTasks;
 // Databases. Every suite defaults to `marten_testing` on 5432 and hard-codes its schema names, so two
 // units on one database collide however their classes are split. Each unit therefore gets its own
 // databases through `marten_testing_database` (which ConnectionSource reads), one per lane:
-// `marten_testing_<project>_<tfm>_w{n}` — never the `marten_testing_w{n}` a CI target's lanes use,
+// `marten_testing_<project>_<tfm>_<tag>_w{n}` (tag: a hash of the checkout path, #5869) — never the `marten_testing_w{n}` a CI target's lanes use,
 // and never anything another repository's lanes (Weasel's) are named.
 //
 // What a unit's own database cannot isolate is a name a suite reaches PAST its lane for: a whole
 // database with a fixed name on the server, or the default database itself. Those are the tracks
-// below. A track is exclusive, so the gate never runs two units that share fixed names at once.
+// below. A track is exclusive, so the gate never runs two units that share fixed names at once, and it is
+// also a Postgres advisory lock on the gate's server, so a gate from another checkout waits for it too (#6069).
 partial class Build
 {
     /// <summary>
@@ -56,10 +57,10 @@ partial class Build
 
     /// <summary>
     /// LocalGate: DEFAULT_SERIALIZER for every unit — <c>Newtonsoft</c>, <c>SystemTextJson</c>, or
-    /// <c>split</c> for CI's pairing (net9.0 on Newtonsoft, net10.0 on System.Text.Json). Unset
+    /// <c>split</c> for CI's pairing (net10.0 on Newtonsoft, net11.0 on System.Text.Json). Unset
     /// leaves the suites on their own default (Newtonsoft) or whatever the shell exported.
     /// </summary>
-    [Parameter("LocalGate: DEFAULT_SERIALIZER for every unit: Newtonsoft, SystemTextJson, or split (CI's net9/net10 pairing)")]
+    [Parameter("LocalGate: DEFAULT_SERIALIZER for every unit: Newtonsoft, SystemTextJson, or split (CI's net10/net11 pairing)")]
     readonly string GateSerializer;
 
     /// <summary>
@@ -72,6 +73,14 @@ partial class Build
     /// <summary>LocalGate: run only these suites (by name, e.g. <c>Linq</c>, or project, e.g. <c>LinqTests</c>).</summary>
     [Parameter("LocalGate: run only these suites, by name (Linq) or project (LinqTests)")]
     readonly string[] GateOnly = [];
+
+    /// <summary>
+    /// LocalGate: tag woven into every lane database name (<c>..._{tag}_w{n}</c>). Defaults to four hex
+    /// digits of this checkout's path, so gates run from different worktrees against one Postgres
+    /// server (#5869) never share a lane database.
+    /// </summary>
+    [Parameter("LocalGate: tag in every lane database name; default is a hash of this checkout's path")]
+    readonly string GateLaneTag;
 
     /// <summary>LocalGate: worker processes across every unit at once. Defaults to half the cores.</summary>
     [Parameter("LocalGate: worker processes across every unit at once (default: half the cores)")]
@@ -91,6 +100,9 @@ partial class Build
 
     // ─── Tracks ────────────────────────────────────────────────────────
 
+    /// <summary>The running gate's tracks as Postgres advisory locks, held across processes (#6069).</summary>
+    GateTrackLocks _trackLocks;
+
     /// <summary>
     /// Whole databases named tenant1..tenant6 and database1 on the server: CoreTests
     /// (jasper_fx_mechanics), DaemonTests (multi_tenancy_by_database, dynamic_spin_up_of_dynamic_tenants),
@@ -102,9 +114,11 @@ partial class Build
     const string ShardDatabasesTrack = "shard-databases";
 
     /// <summary>
-    /// The default database itself, reached past the lane: EventSourcingTests' testing_projections
-    /// hard-codes localhost:5432/marten_testing. Every other unit is relocated, so this only keeps two
-    /// frameworks of EventSourcingTests apart, and StressTests away from it.
+    /// Whole databases with fixed names that EventSourcingTests reaches past its lanes for: the
+    /// multi-database explorer suites (explorer_5383_north and _south, and the compliance tenant
+    /// databases). Two frameworks of EventSourcingTests running at once deadlock on them, so the track
+    /// keeps them apart, and StressTests away from them. (testing_projections used to reach the default
+    /// database too; it uses ConnectionSource now.)
     /// </summary>
     const string DefaultDatabaseTrack = "default-database";
 
@@ -206,6 +220,8 @@ partial class Build
                 connectionBudget = workersTheServerHolds(checkPostgres(gateBaseConnectionString, "the gate database"));
 
             var ledgers = new ConcurrentDictionary<string, TestLedger>(StringComparer.Ordinal);
+            using var trackLocks = new GateTrackLocks(gateBaseConnectionString);
+            _trackLocks = trackLocks;
             var gate = declareGate(suites, ledgers);
             gate.WorkerBudget = gateWorkerBudget(gate.WorkerBudget, connectionBudget);
 
@@ -226,14 +242,50 @@ partial class Build
                     recordTestLedger(ledger, project, framework, unit.Results, GateLedgerDirectory);
             }
 
+            // #6064: the AOT runtime smoke under the JIT. The native run stays ./build.sh test-aot-runtime.
+            var jitSmokeFailure = runsAotRuntimeSmokeUnderJit() ? aotRuntimeSmokeUnderJit() : null;
+
             if (results.ExitCode != 0)
             {
                 Assert.Fail($"LocalGate exited {results.ExitCode}: {results.Clean.Count} clean, " +
                             $"{results.Flaky.Count} passed on retry, {results.Failed.Count} failed, " +
                             $"{results.Indeterminate.Count} indeterminate, {results.NotRun.Count} not run" +
-                            (results.AbortReason is { } reason ? $" — {reason}" : ""));
+                            (results.AbortReason is { } reason ? $" — {reason}" : "") +
+                            (jitSmokeFailure is null ? "" : $"; {jitSmokeFailure}"));
             }
+
+            if (jitSmokeFailure is not null) Assert.Fail(jitSmokeFailure);
         });
+
+    const string AotRuntimeJitSuite = "AotRuntimeJit";
+
+    /// <summary>By default, and under --gate-only when it names AotRuntimeJit.</summary>
+    bool runsAotRuntimeSmokeUnderJit() =>
+        GateOnly.Length == 0 || GateOnly.Contains(AotRuntimeJitSuite, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Runs src/Marten.AotRuntimeSmoke under the JIT from the gate's Release build, on a database of its
+    /// own named like a lane's. Returns the failure, or null.
+    /// </summary>
+    string aotRuntimeSmokeUnderJit()
+    {
+        var builder = new NpgsqlConnectionStringBuilder(gateBaseConnectionString);
+        builder.Database = $"{builder.Database}_aotruntimejit_{laneTag()}";
+        ensureLaneDatabases(gateBaseConnectionString, [builder.ConnectionString]);
+
+        Log.Information("LocalGate: the AOT runtime smoke under the JIT, on {Database}", builder.Database);
+        try
+        {
+            runAotRuntimeSmokeUnderJit("Release", builder.ConnectionString, noBuild: true);
+            Log.Information("LocalGate: AOT runtime smoke under the JIT: OK");
+            return null;
+        }
+        catch (Exception e)
+        {
+            Log.Error("LocalGate: AOT runtime smoke under the JIT FAILED: {Message}", e.Message);
+            return "the AOT runtime smoke failed under the JIT (see its output above)";
+        }
+    }
 
     List<GateSuite> selectGateSuites()
     {
@@ -255,10 +307,13 @@ partial class Build
             suite.Name.Equals(name, StringComparison.OrdinalIgnoreCase) ||
             Path.GetFileNameWithoutExtension(suite.Project).Equals(name, StringComparison.OrdinalIgnoreCase);
 
-        var missing = GateOnly.Where(name => !all.Any(s => matches(s, name))).ToArray();
+        var missing = GateOnly
+            .Where(name => !all.Any(s => matches(s, name)))
+            .Where(name => !name.Equals(AotRuntimeJitSuite, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
         if (missing.Length > 0)
             throw new ArgumentException(
-                $"--gate-only {string.Join(", ", missing)}: no such suite. Known: {string.Join(", ", all.Select(s => s.Name))}.");
+                $"--gate-only {string.Join(", ", missing)}: no such suite. Known: {string.Join(", ", all.Select(s => s.Name))}, {AotRuntimeJitSuite}.");
 
         // --gate-only names a suite outright, opt-in or not.
         return all.Where(s => GateOnly.Any(name => matches(s, name))).ToList();
@@ -273,7 +328,13 @@ partial class Build
             Solution = RootDirectory / "src" / "Marten.slnx",
             SkipBuild = GateSkipBuild,
             DurationsPath = RootDirectory / ".bobcat" / "gate-durations.json",
-            Log = message => Log.Information("{Message:l}", message),
+            Log = message =>
+            {
+                Log.Information("{Message:l}", message);
+
+                // #6069: a finished unit hands its tracks to the next gate waiting on them
+                _trackLocks?.ReleaseIfFinished(message);
+            },
 
             // One solution build covers both target frameworks. The gate's default build passes
             // -f per framework, which fails the netstandard2.0 source generator projects.
@@ -326,6 +387,9 @@ partial class Build
     /// </summary>
     IWorkerFactory workerFactoryFor(GateSuite suite, GateUnit unit)
     {
+        // #6069: the unit's tracks across processes too, before it touches the databases they name
+        _trackLocks?.Acquire(unit.Name, suite.Tracks);
+
         var shared = gateSerializerFor(unit.Framework) is { } serializer
             ? new Dictionary<string, string> { ["DEFAULT_SERIALIZER"] = serializer }
             : null;
@@ -334,7 +398,7 @@ partial class Build
 
         var server = suite.Server ?? gateBaseConnectionString;
         var lanes = Enumerable.Range(0, Math.Max(1, unit.Workers))
-            .Select(lane => gateLaneConnectionString(server, unit, lane))
+            .Select(lane => gateLaneConnectionString(server, unit, lane, laneTag()))
             .ToArray();
         ensureLaneDatabases(server, lanes);
 
@@ -347,11 +411,11 @@ partial class Build
     /// one project apart; the base database's name keeps a gate's lanes off a CI target's
     /// (<c>marten_testing_w{n}</c>).
     /// </summary>
-    static string gateLaneConnectionString(string server, GateUnit unit, int lane)
+    static string gateLaneConnectionString(string server, GateUnit unit, int lane, string tag)
     {
         var builder = new NpgsqlConnectionStringBuilder(server);
         var slug = new string(unit.Name.ToLowerInvariant().Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray());
-        var database = $"{builder.Database}_{slug}_w{lane}";
+        var database = $"{builder.Database}_{slug}_{tag}_w{lane}";
 
         // Postgres truncates an identifier past NAMEDATALEN - 1 (63 by default) and two long
         // names could then land on one database. Refuse instead.
@@ -362,13 +426,25 @@ partial class Build
         return builder.ConnectionString;
     }
 
+    /// <summary>
+    /// Two gates on one server (two worktrees, two agents) used to build identical lane names and
+    /// ran their suites into one schema (#5869). Four hex digits keep the longest unit name at 63.
+    /// </summary>
+    string laneTag()
+    {
+        if (!string.IsNullOrWhiteSpace(GateLaneTag)) return GateLaneTag.Trim().ToLowerInvariant();
+
+        var hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(RootDirectory.ToString()));
+        return Convert.ToHexString(hash, 0, 2).ToLowerInvariant();
+    }
+
     string gateSerializerFor(string framework)
     {
         if (string.IsNullOrWhiteSpace(GateSerializer)) return null;
 
         return GateSerializer.Trim().ToLowerInvariant() switch
         {
-            "split" => framework == "net9.0" ? "Newtonsoft" : "SystemTextJson",
+            "split" => framework == "net10.0" ? "Newtonsoft" : "SystemTextJson",
             "newtonsoft" => "Newtonsoft",
             "systemtextjson" or "stj" => "SystemTextJson",
             _ => throw new ArgumentException(

@@ -73,6 +73,9 @@ Two things to know about the shape of the throttle:
 - **It's a two-layer model.** The cap bounds how many cells run at once; each cell still uses its own internal
   slice workers while it runs. A cap of 4 therefore means "4 rebuilding projections/tenants at a time," not 4
   concurrent database operations.
+- **It does not bound memory.** Each rebuilding cell loads its own pages and builds its own batch. If a rebuild
+  across many tenants runs a node short of memory, set `opts.Projections.TenantLoadBudget`. See
+  [Bounding Daemon Memory with Per-Tenant Agents](/events/projections/async-daemon#bounding-daemon-memory-with-per-tenant-agents).
 
 For one-off operational rebuilds, the `--max-concurrent` flag on the [command line](/configuration/cli) overrides
 the configured value for that run:
@@ -167,7 +170,7 @@ The flag defaults to `false`.
 ## Optimized Projection Rebuilds <Badge type="tip" text="7.30" />
 
 ::: tip
-This optimization must be explicitly opted into via `opts.Events.UseOptimizedProjectionRebuilds = true`. It is not enabled by default because it requires a database schema migration for users upgrading from earlier versions.
+This optimization must be explicitly opted into via `opts.Events.UseOptimizedProjectionRebuilds = true`. It is not enabled by default because it is only correct when exactly one single stream projection uses any given event stream (see the warning below); it also adds columns to the progression table, which means a schema migration.
 :::
 
 ::: warning
@@ -232,7 +235,9 @@ new version (`V{n+1}`) starts as `Async` it catches up over the **entire** event
 the events the previous version already processed and already fired side effects for. Without a
 guard, deploying a new version re-emits every one of those side effects.
 
-Opt into `GateSideEffectsBehindPriorVersion` to prevent that:
+Marten guards against that by default: `GateSideEffectsBehindPriorVersion` is **on** unless a projection
+turns it off. You only need to set it to turn the gate off (`false`), for example when re-emitting
+every side effect on a new version is what you want:
 
 ```cs
 public class TripProjection : SingleStreamProjection<Trip, Guid>
@@ -241,42 +246,48 @@ public class TripProjection : SingleStreamProjection<Trip, Guid>
     {
         Version = 3;
 
-        // Only fire side effects for events the prior version (V2) never processed
-        GateSideEffectsBehindPriorVersion = true;
+        // On by default: side effects only fire for events the prior version (V2) never processed.
+        // Set to false to opt out and let the new version re-emit them all
+        GateSideEffectsBehindPriorVersion = false;
     }
 
     // Apply(...) methods and RaiseSideEffects(...) as usual
 }
 ```
 
-When the flag is on and a new version starts behind the highest prior version's persisted
-progression mark `N`, the daemon does the catch-up in two phases:
+When the gate is on and a new version starts behind the highest prior version's persisted
+progression mark `N`, the shard catches up in two phases, both inside its ordinary running agent:
 
-1. **Warm-up** — replay `(current, N]` in **Rebuild** mode, so `RaiseSideEffects()` is suppressed
-   while the new version's documents are brought up to the same point the prior version reached.
-2. **Continuous** — hand off to normal continuous execution from `N`, so side effects fire only for
+1. **Warm-up** — the agent runs from its own progress up to `N` with side effects suppressed, so
+   `RaiseSideEffects()` does not fire while the new version's documents are brought up to the point
+   the prior version reached.
+2. **Past the mark** — the same agent carries on past `N`, and side effects fire only for
    events past `N` — the ones the prior version never saw.
+
+The warm-up no longer runs inside the agent's start path (jasperfx#598/#610), so a gated shard
+starts as quickly as any other and reports its warm-up through its shard state
+(`SideEffectsSuppressed` and `SideEffectGateMark`). To pace how many shards warm up at once, set
+`opts.Projections.MaxConcurrentSideEffectGateWarmupsPerDatabase`. The old
+`SideEffectGateTimeout` setting is obsolete and ignored.
 
 Behavioral notes:
 
 - **Resume after interruption** — the trigger is *own progress `< N`*, not *own progress `== 0`*. If
   the warm-up is interrupted (a crash or restart at `M < N`), the next start resumes the suppressed
   replay over `(M, N]` rather than re-emitting side effects from the beginning.
-- **Failed warm-up leaves the shard paused** — if the warm-up replay throws, the shard is left
-  `Paused` with the exception attached and continuous execution does **not** start (so no side
-  effects fire over history the prior version already covered). Restarting the shard resumes the
-  suppressed warm-up from its persisted progress.
+- **Failed warm-up leaves the shard paused** — if the warm-up throws, the shard is left
+  `Paused` with the exception attached and no side effects fire over history the prior version
+  already covered. Restarting the shard resumes the suppressed warm-up from its persisted progress.
 - **Incompatible with `SubscribeFromPresent`** — subscribing from "present" deliberately ignores
-  persisted progression, so there is no prior mark to gate against. The gate is skipped and a warning
-  is logged.
-- **No-ops when not needed** — the gate never adds a warm-up phase for `Version == 1`, when the flag
-  is off, or when the new version's own progress is already at/past the prior mark (a plain resume).
+  persisted progression, so there is no prior mark to gate against. The gate is skipped (logged at information level, since nobody chose that combination — the gate is on by default).
+- **No-ops when not needed** — the gate never adds a warm-up phase for `Version == 1`, when the gate
+  is turned off, or when the new version's own progress is already at/past the prior mark (a plain resume).
 - **Accepted overlap window** — `N` is snapshotted when the new version starts. If an old version is
   still running and advances past `N` afterward, the new version can re-emit side effects for that
   `(N, old_final]` overlap. Stop the old version before (or as) the new one starts to avoid the
   window; fully coordinated drain-and-handoff is a separate concern.
 
-## Rebuilding a Single Stream <Badge type="tip" text="7.28" />
+## Rebuilding a Single Stream <Badge type="tip" text="7.28" /> {#rebuilding-a-single-stream}
 
 A long standing request has been to be able to rebuild only a single stream or subset of streams
 by stream id (or string key). Marten now has a (admittedly crude) ability to do so with this syntax
@@ -289,3 +300,35 @@ await theStore.Advanced.RebuildSingleStreamAsync<SimpleAggregate>(streamId);
 ```
 <sup><a href='https://github.com/JasperFx/marten/blob/master/src/EventSourcingTests/Aggregation/rebuilding_a_single_stream_projection.cs#L32-L36' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_rebuild_single_stream' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
+
+The call commits the rebuilt document itself. A stream that folds to nothing (its aggregate was deleted, say) deletes
+the document, which is what a full rebuild would leave behind.
+
+When the document is written by an **asynchronous** single-stream projection, Marten 10 takes one of three paths
+([#6071](https://github.com/JasperFx/marten/issues/6071)):
+
+1. **A daemon of this store in this process runs the projection's shard.** The rebuild goes through that daemon and is
+   bound to the shard's next batch. That batch re-folds the stream from its first event and commits the document
+   together with the shard's progression, so the rebuild can't race the shard. The call returns when the batch
+   commits.
+2. **The shard is running on another node.** If the shard's progression row was written in the last 30 seconds by a
+   running agent, the call throws `IdentityRebuildRefusedException` with
+   `Reason == IdentityRebuildRefusal.ShardLiveOnAnotherNode`. Do the rebuild on the node that runs the projection.
+3. **Otherwise** the stream is aggregated and stored right here, outside any daemon. That is only safe when no daemon is
+   running the projection. Without extended progression tracking, a shard on another node that has had nothing to do
+   for 30 seconds stops rewriting its row and looks stopped, so the call isn't refused.
+
+Inline and live projections always take the third path, since there is no shard to race.
+
+You can also rebuild one identity through a running daemon directly. It works for any single-stream projection the
+daemon runs, and refuses with `IdentityRebuildRefusedException` when it can't (the shard isn't running there, is
+rebuilding, or has never committed anything):
+
+```cs
+var result = await daemon.RebuildIdentityAsync("TripProjection", tenantId: null, identity: tripId, token);
+
+// The document is now consistent with every event of its stream up to result.BoundCeiling
+```
+
+A projection whose documents are kept in custom projection storage, like an EF Core entity from
+`Marten.EntityFrameworkCore`, can't be rebuilt one identity at a time. Use `RebuildProjectionAsync()` for those.
