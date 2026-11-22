@@ -89,4 +89,61 @@ public class natural_key_caching_and_identity_map: OneOffConfigurationsContext
         (await session.Events.FetchLatest<OrderAggregate, OrderNumber>(original)).ShouldBeNull();
         (await session.Events.FetchLatest<OrderAggregate, OrderNumber>(renamed))!.Id.ShouldBe(streamId);
     }
+
+    public enum FoldedLifecycle
+    {
+        Async,
+        Live
+    }
+
+    [Theory]
+    [InlineData(FoldedLifecycle.Async, false)]
+    [InlineData(FoldedLifecycle.Async, true)]
+    [InlineData(FoldedLifecycle.Live, false)]
+    [InlineData(FoldedLifecycle.Live, true)]
+    public async Task events_appended_since_a_fetch_are_folded_once(FoldedLifecycle lifecycle, bool thenByStreamId)
+    {
+        StoreOptions(opts =>
+        {
+            if (lifecycle == FoldedLifecycle.Async)
+            {
+                opts.Projections.Snapshot<OrderAggregate>(SnapshotLifecycle.Async);
+            }
+            else
+            {
+                opts.Projections.LiveStreamAggregation<OrderAggregate>();
+            }
+
+            opts.Events.AggregateWriteCaching.Cache = theCache;
+            opts.Events.CacheAggregatesForWriting<OrderAggregate>();
+        });
+
+        var number = new OrderNumber($"FOLD-{lifecycle}-{thenByStreamId}");
+        var streamId = await startOrder(number);
+
+        await using (var session = theStore.LightweightSession())
+        {
+            var stream = await session.Events.FetchForWriting<OrderAggregate, OrderNumber>(number);
+            stream.AppendOne(new OrderItemAdded("Gizmo", 5m));
+
+            // Answered from the identity map, with the pending event folded onto the fetched aggregate
+            (await session.Events.FetchLatest<OrderAggregate, OrderNumber>(number))!.TotalAmount.ShouldBe(15m);
+
+            // The fold leaves the stream out of the identity map, as a FetchLatest by stream id does, so the next
+            // fetch reads the committed stream rather than folding the pending event a second time
+            var again = thenByStreamId
+                ? await session.Events.FetchLatest<OrderAggregate>(streamId)
+                : await session.Events.FetchLatest<OrderAggregate, OrderNumber>(number);
+            again!.Id.ShouldBe(streamId);
+            again.TotalAmount.ShouldBe(10m);
+
+            await session.SaveChangesAsync();
+        }
+
+        // Nor is the folded aggregate written back to the cache under the version it was fetched at
+        await using var after = theStore.LightweightSession();
+        var fetched = await after.Events.FetchForWriting<OrderAggregate, OrderNumber>(number);
+        fetched.CurrentVersion.ShouldBe(3);
+        fetched.Aggregate!.TotalAmount.ShouldBe(15m);
+    }
 }

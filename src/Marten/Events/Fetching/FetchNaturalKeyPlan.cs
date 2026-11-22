@@ -185,6 +185,25 @@ internal abstract class FetchNaturalKeyPlan<TDoc, TNaturalKey, TId>: IAggregateF
         return Equals(current, keyValue);
     }
 
+    /// <summary>
+    /// Called before folding the events appended to a stream fetched earlier in the session onto its aggregate, as
+    /// FetchAsyncPlan.FetchForReading and FetchLivePlan.FetchForReading do for a stream id. The fold lands on the
+    /// very instance the stream holds, which then carries events its version says it does not. So the stream
+    /// leaves the identity map, and the instance's write cache registration is dropped, or the next fetch would
+    /// fold the same events a second time.
+    /// </summary>
+    protected void releaseStreamBeforeFolding(DocumentSessionBase session, TId streamId, IEventStream<TDoc> stream)
+    {
+        if (stream.Aggregate == null || stream.Events.Count == 0) return;
+
+        if (_cache != null)
+        {
+            session.AggregateWriteCache.Discard(cacheKeyFor(session, streamId));
+        }
+
+        session.EjectAggregateFromIdentityMap<IEventStream<TDoc>, TId>(streamId);
+    }
+
     protected virtual async Task prepareAsync(DocumentSessionBase session, CancellationToken cancellation)
     {
         // The event storage includes the natural key lookup tables

@@ -82,6 +82,8 @@ internal class FetchNaturalKeyLivePlan<TDoc, TNaturalKey, TId>: FetchNaturalKeyP
             {
                 if (!currentKeyMatches(stream, keyValue)) continue;
 
+                releaseStreamBeforeFolding(session, streamId, stream);
+
                 var aggregate = await _aggregator
                     .BuildAsync(stream.Events, session, stream.Aggregate, streamId, _identitySetter, cancellation)
                     .ConfigureAwait(false);
