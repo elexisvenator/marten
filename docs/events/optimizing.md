@@ -223,7 +223,7 @@ Before Marten 10, enrolling a Live aggregate was accepted and did nothing.
 
 Every fetch for writing of an enrolled type uses the cache: `FetchForWriting(id)`, `FetchForExclusiveWriting(id)`,
 `FetchForWriting(id, expectedVersion)`, the same calls through a batch query, and `FetchManyForWriting`. So do
-the same fetches by [natural key](/events/natural-keys#identity-map-and-write-caching).
+the same fetches by natural key.
 Wolverine's aggregate handler workflow calls the expected-version overload when the command carries a version.
 The expected version is checked against the stream's version in the database, not the cached aggregate's.
 
